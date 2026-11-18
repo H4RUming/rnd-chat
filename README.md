@@ -13,13 +13,14 @@ MCP 서버들은 각자 다른 저장소에 있고 따로 띄웁니다. 이 저�
 
 ## 지금 되는 것
 
-- 설정 파일로 모델 서버와 MCP 서버 목록을 정합니다.
+- 설정 파일로 모델 서버, MCP 서버 목록, 로그인 계정을 정합니다.
 - 모델이 도구를 부르면 해당 서버에서 실행해 결과를 돌려주고, 글로 답할 때까지 되풀이합니다(에이전트 루프).
-- 터미널에서 질문해 볼 수 있습니다.
+- 로그인해야 쓸 수 있는 웹 채팅 화면이 있습니다. 어떤 자료를 조회하고 있는지 진행 상황이 보이고, 답의 표·링크가 그려집니다.
+- 터미널에서도 질문해 볼 수 있습니다.
 
-웹 화면, 로그인, 외부 공개는 아직 없습니다.
+아직 없는 것: 외부 공개용 터널 설정, 글자가 흘러나오는 방식의 답(지금은 완성된 답이 한 번에 나옵니다), 대화 저장(서버를 다시 띄우면 대화가 사라집니다).
 
-## 설치와 실행
+## 설치
 
 ```bash
 uv venv --python 3.12 .venv
@@ -27,11 +28,54 @@ uv pip install --python .venv/bin/python -r requirements.txt
 cp config.example.toml config.toml && chmod 600 config.toml   # config.toml 은 git 에 올라가지 않는다
 # config.toml 의 [llm] base_url 을 모델 서버 주소로 고친다
 .venv/bin/python -m chat.cli --tools                           # 붙은 MCP 서버와 도구 확인
-.venv/bin/python -m chat.cli "최근 3년 인공지능 반도체 과제가 연도별로 몇 건이야?"
-.venv/bin/python -m chat.cli                                   # 대화형
 ```
 
 모델 서버는 OpenAI 호환 API(`/v1/chat/completions`)와 도구 호출(`tool_calls`)을 지원해야 합니다. 모델 서버에는 추론 요청만 보냅니다.
+
+## 웹 채팅
+
+계정을 먼저 만듭니다. 비밀번호 해시를 만들어 `config.toml`에 붙여 넣습니다.
+
+```bash
+.venv/bin/python -m chat.passwd        # 비밀번호를 두 번 묻고 password_hash = "…" 한 줄을 내놓는다
+```
+
+```toml
+[[users]]
+name = "이름"
+password_hash = "scrypt$…"
+```
+
+```bash
+.venv/bin/python -m chat.web           # http://127.0.0.1:8080
+```
+
+계정이 하나도 없으면 서버는 뜨지 않습니다. `password = "평문"`으로 적어도 동작하지만, 시작할 때 경고가 나오며 해시를 권합니다.
+
+### 접근 통제와 보안
+
+외부에 공개할 것을 전제로 만들었습니다.
+
+- **127.0.0.1에만 엽니다.** 밖에서는 터널을 거쳐서만 들어옵니다. 다른 주소에 열면 시작할 때 경고합니다.
+- **로그인 화면과 정적 파일 말고는 모두 세션이 필요합니다.** 세션은 서버 메모리에 두고, 쿠키에는 무작위 토큰만 싣습니다(`HttpOnly`, `SameSite=Strict`, https면 `Secure`). 쓰지 않으면 `session_hours` 뒤에 끊기고, 한 계정의 세션은 5개까지입니다.
+- **로그인 시도 제한.** 한 계정에서 5번 연달아 틀리면 60초 잠기고, 풀린 뒤 또 틀리면 두 배씩 늘어납니다(최대 1시간). 접속 IP별로도 더 느슨한 한도(20번)를 둡니다. 계정이 없는지 비밀번호가 틀렸는지는 구분해 알려 주지 않고, 걸리는 시간도 같게 맞춥니다.
+- **비밀번호는 scrypt 해시로 대조합니다.**
+- **요청 위조 방지.** 상태를 바꾸는 요청은 `Origin`이 같은 호스트여야 하고, API는 전용 헤더까지 있어야 합니다.
+- **허용한 호스트 이름으로 온 요청만 받습니다**(`allowed_hosts`). 외부 공개 시 공개 도메인을 더합니다.
+- **보안 헤더.** 모든 응답에 CSP(인라인 스크립트 금지, 외부 자원 금지), `X-Frame-Options: DENY`, `nosniff`, `Cache-Control: no-store`를 붙입니다. https로 들어온 요청에는 HSTS도 붙습니다.
+- **모델의 답은 신뢰하지 않습니다.** 브라우저에서 `innerHTML` 없이 DOM 노드로만 그리고, 링크는 http·https만 허용합니다.
+- **대화는 계정별로 따로 둡니다.** 남의 대화는 id를 알아도 볼 수 없습니다.
+- **동시에 처리하는 질문 수를 묶습니다**(`max_concurrent`). 한 사람이 답을 기다리는 동안 또 보낼 수 없습니다.
+- 내부 오류 내용은 화면에 내보내지 않고 서버 로그에만 남깁니다. 로그인 성공·실패는 이름과 IP로 기록합니다.
+
+Cloudflare 터널 뒤에 둘 때는 `[web]`의 `allowed_hosts`에 공개 도메인을 더하고 `trust_forwarded = true`로 바꿉니다. 그래야 접속 IP별 제한이 실제 접속자 기준으로 걸립니다. 터널 없이 이 값을 켜면 접속자가 IP를 속일 수 있으니 켜지 않습니다.
+
+## 터미널에서 질문
+
+```bash
+.venv/bin/python -m chat.cli "최근 3년 인공지능 반도체 과제가 연도별로 몇 건이야?"
+.venv/bin/python -m chat.cli           # 대화형
+```
 
 ## 동작 방식과 상한
 
@@ -51,6 +95,10 @@ cp config.example.toml config.toml && chmod 600 config.toml   # config.toml 은 
 | `chat/llm.py` | 모델 API 호출 |
 | `chat/agent.py` | 에이전트 루프와 안내문 |
 | `chat/cli.py` | 터미널 시험용 |
+| `chat/auth.py` | 계정, 비밀번호 대조, 로그인 시도 제한, 세션 |
+| `chat/web.py` | 웹 서버: 접근 통제, 보안 헤더, 채팅 API |
+| `chat/static/` | 화면(HTML·CSS·JS) |
+| `chat/passwd.py` | 비밀번호 해시 만들기 |
 
 ## 테스트
 

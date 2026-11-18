@@ -32,3 +32,18 @@ url = "http://127.0.0.1:8767/mcp"
 [[mcp]]
 name = "ntis"
 url = "http://127.0.0.1:8768/mcp"
+
+[web]
+host = "127.0.0.1"          # 밖에서 직접 붙지 못하게 이 장비 안에서만 연다(외부 공개는 터널을 거친다)
+port = 8080
+session_hours = 12          # 이만큼 쓰지 않으면 다시 로그인
+max_concurrent = 2          # 동시에 처리하는 질문 수
+max_question_chars = 4000
+trust_forwarded = false     # Cloudflare 터널 뒤에 둘 때만 true (접속 IP 를 CF-Connecting-IP 에서 읽는다)
+allowed_hosts = ["127.0.0.1", "localhost"]   # 이 이름으로 온 요청만 받는다. 외부 공개 시 공개 도메인을 더한다
+
+# 로그인 계정. 계정이 하나도 없으면 웹 서버는 뜨지 않는다.
+# 비밀번호 해시는  python -m chat.passwd  로 만들어 붙여 넣는다.
+# [[users]]
+# name = "이름"
+# password_hash = "scrypt$..."

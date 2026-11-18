@@ -27,6 +27,17 @@ class Agent:
 
 
 @dataclass(frozen=True)
+class Web:
+    host: str = '127.0.0.1'
+    port: int = 8080
+    session_hours: float = 12.0          # 이만큼 쓰지 않으면 다시 로그인
+    max_concurrent: int = 2              # 동시에 처리하는 질문 수(모델 서버에 거는 부하의 상한)
+    max_question_chars: int = 4000
+    trust_forwarded: bool = False        # Cloudflare 뒤에 둘 때만 true: 접속 IP 를 CF-Connecting-IP 에서 읽는다
+    allowed_hosts: tuple[str, ...] = ('127.0.0.1', 'localhost')   # 이 이름으로 온 요청만 받는다(포트 제외)
+
+
+@dataclass(frozen=True)
 class McpServer:
     name: str
     url: str
@@ -37,6 +48,8 @@ class Settings:
     llm: Llm
     agent: Agent
     servers: tuple[McpServer, ...]
+    web: Web = Web()
+    users: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> 'Settings':
@@ -48,6 +61,7 @@ class Settings:
         if not str(llm.get('model') or '').strip():
             raise ValueError('설정 [llm] model 이 없습니다')
         agent = _table(config, 'agent')
+        web = _table(config, 'web')
         servers, seen = [], set()
         for entry in config.get('mcp', []):
             name, url = str(entry.get('name') or '').strip(), str(entry.get('url') or '').strip()
@@ -64,13 +78,33 @@ class Settings:
             agent=Agent(max_steps=int(_number(agent, 'max_steps', 12, 1, 50)),
                         tool_result_chars=int(_number(agent, 'tool_result_chars', 24000, 1000, 400000)),
                         max_images=int(_number(agent, 'max_images', 4, 0, 16))),
-            servers=tuple(servers))
+            servers=tuple(servers),
+            web=Web(host=str(web.get('host') or '127.0.0.1'), port=int(_number(web, 'port', 8080, 1, 65535)),
+                    session_hours=_number(web, 'session_hours', 12.0, 0.1, 720.0),
+                    max_concurrent=int(_number(web, 'max_concurrent', 2, 1, 16)),
+                    max_question_chars=int(_number(web, 'max_question_chars', 4000, 100, 100000)),
+                    trust_forwarded=_flag(web, 'trust_forwarded', False), allowed_hosts=_hosts(web)),
+            users=tuple(entry for entry in config.get('users', []) if isinstance(entry, dict)))
 
 
 def _table(config: dict[str, Any], name: str) -> dict[str, Any]:
     value = config.get(name, {})
     if not isinstance(value, dict):
         raise ValueError(f'설정 파일의 [{name}] 은 표(table)여야 합니다')
+    return value
+
+
+def _hosts(web: dict[str, Any]) -> tuple[str, ...]:
+    value = web.get('allowed_hosts', ['127.0.0.1', 'localhost'])
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item.strip() and '*' not in item for item in value):
+        raise ValueError('설정 [web] allowed_hosts 는 호스트 이름 목록이어야 합니다(와일드카드 불가)')
+    return tuple(item.strip().lower() for item in value)
+
+
+def _flag(table: dict[str, Any], name: str, default: bool) -> bool:
+    value = table.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f'설정 {name} 은 true 또는 false 여야 합니다')
     return value
 
 
