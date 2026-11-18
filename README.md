@@ -60,7 +60,7 @@ password_hash = "scrypt$…"
 
 외부에 공개할 것을 전제로 만들었습니다.
 
-- **기본은 127.0.0.1에만 엽니다.** 밖에서는 터널을 거쳐서만 들어옵니다. 믿을 수 있는 내부망에서 다른 기기로 접속하려면 `[web] host = "0.0.0.0"`으로 바꾸고 접속할 주소를 `allowed_hosts`에 더합니다. 이때는 암호화 없이(http) 오가므로 시작할 때 경고가 나옵니다.
+- **기본은 127.0.0.1에만 엽니다.** 밖에서는 터널을 거쳐서만 들어옵니다. 내부망의 다른 기기에서 접속하려면 아래 "내부망에 https로 열기"를 따릅니다.
 - **로그인 화면과 정적 파일 말고는 모두 세션이 필요합니다.** 세션은 서버 메모리에 두고, 쿠키에는 무작위 토큰만 싣습니다(`HttpOnly`, `SameSite=Strict`, https면 `Secure`). 쓰지 않으면 `session_hours` 뒤에 끊기고, 한 계정의 세션은 5개까지입니다.
 - **로그인 시도 제한.** 한 계정에서 5번 연달아 틀리면 60초 잠기고, 풀린 뒤 또 틀리면 두 배씩 늘어납니다(최대 1시간). 접속 IP별로도 더 느슨한 한도(20번)를 둡니다. 계정이 없는지 비밀번호가 틀렸는지는 구분해 알려 주지 않고, 걸리는 시간도 같게 맞춥니다.
 - **비밀번호는 scrypt 해시로 대조합니다.**
@@ -72,7 +72,35 @@ password_hash = "scrypt$…"
 - **동시에 처리하는 질문 수를 묶습니다**(`max_concurrent`). 한 사람이 답을 기다리는 동안 또 보낼 수 없습니다.
 - 내부 오류 내용은 화면에 내보내지 않고 서버 로그에만 남깁니다. 로그인 성공·실패는 이름과 IP로 기록합니다.
 
-Cloudflare 터널 뒤에 둘 때는 `[web]`의 `allowed_hosts`에 공개 도메인을 더하고 `trust_forwarded = true`로 바꿉니다. 그래야 접속 IP별 제한이 실제 접속자 기준으로 걸립니다. 터널 없이 이 값을 켜면 접속자가 IP를 속일 수 있으니 켜지 않습니다.
+### 내부망에 https로 열기
+
+같은 망(LAN, Tailscale 등)의 다른 기기에서 접속하려면 `0.0.0.0`에 열고 https를 켭니다. 로그인 비밀번호와 대화가 망 위를 그대로 지나가지 않게 하기 위해서입니다.
+
+```bash
+.venv/bin/python -m chat.tlscert --name 호스트이름 --ip 192.168.0.10     # 접속에 쓸 이름·주소를 모두 적는다
+```
+
+```toml
+[web]
+host = "0.0.0.0"
+port = 8443
+tls_cert = "certs/cert.pem"
+tls_key = "certs/key.pem"
+allowed_hosts = ["127.0.0.1", "localhost", "호스트이름", "192.168.0.10"]
+```
+
+`python -m chat.tlscert`는 자체 서명 인증서를 만듭니다(`openssl` 필요, `certs/`는 git에 올라가지 않습니다). 자체 서명이라 브라우저가 처음 접속할 때 경고를 보여 줍니다. 경고를 없애려면 접속하는 기기에 `certs/cert.pem`을 신뢰하는 인증서로 등록하거나, 공인 인증서를 받아 같은 설정에 넣습니다(Tailscale이면 `tailscale cert`). https를 켜지 않고 `0.0.0.0`에 열면 시작할 때 경고가 나옵니다.
+
+HSTS는 직접 https로 열었을 때는 붙이지 않습니다. 내부망 이름에 붙이면 브라우저가 그 이름의 다른 포트(http 서비스)까지 https로 바꿔 버리기 때문입니다.
+
+### Cloudflare 터널 뒤에 둘 때
+
+브라우저와 Cloudflare 사이의 https는 Cloudflare가 맡습니다. 터널(`cloudflared`)과 이 서버는 같은 장비에서 오가므로 두 가지 모두 됩니다.
+
+- 이 서버를 http로 두고(`tls_cert` 없음, `host = "127.0.0.1"`) 터널이 `http://localhost:8080`으로 붙는 방식. 가장 단순합니다.
+- 이 서버를 https로 둔 채 터널이 `https://localhost:8443`으로 붙는 방식. 자체 서명 인증서면 터널 설정에 `originRequest: noTLSVerify: true`를 주거나 `caPool`로 `certs/cert.pem`을 지정합니다.
+
+어느 쪽이든 `[web]`의 `allowed_hosts`에 공개 도메인을 더하고 `trust_forwarded = true`로 바꿉니다. 그래야 접속 IP별 제한이 실제 접속자 기준으로 걸립니다. 터널 없이 이 값을 켜면 접속자가 IP를 속일 수 있으니 켜지 않습니다. 터널을 거쳐 들어온 요청에는 HSTS가 붙습니다.
 
 ## 터미널에서 질문
 
@@ -103,6 +131,7 @@ Cloudflare 터널 뒤에 둘 때는 `[web]`의 `allowed_hosts`에 공개 도메�
 | `chat/web.py` | 웹 서버: 접근 통제, 보안 헤더, 채팅 API |
 | `chat/static/` | 화면(HTML·CSS·JS) |
 | `chat/passwd.py` | 비밀번호 해시 만들기 |
+| `chat/tlscert.py` | 내부망용 자체 서명 인증서 만들기 |
 
 ## 테스트
 

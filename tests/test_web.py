@@ -1,10 +1,12 @@
 """로그인(계정·잠금·세션)과 웹 서버(접근 통제, CSRF 방지, 보안 헤더, 채팅 흐름, 대화 분리)."""
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from chat import agent, auth, web
+from chat import agent, auth, tlscert, web
 from chat.llm import LlmError
 from chat.settings import Agent, Llm, Settings, Web
 
@@ -140,6 +142,39 @@ class WebTests(unittest.TestCase):
         self.assertEqual(client.get('/login').headers['cache-control'], 'no-store')
         self.assertIn('max-age', client.get('/login', headers={'x-forwarded-proto': 'https'}).headers['strict-transport-security'])
         self.assertEqual(client.get('/login', headers={'host': 'evil.example'}).status_code, 400)
+
+    def test_direct_https_sets_secure_cookie_but_no_hsts(self):
+        client = TestClient(self.app, base_url='https://localhost', follow_redirects=False)
+        headers = client.get('/login').headers
+        self.assertEqual(headers['cross-origin-opener-policy'], 'same-origin')
+        self.assertNotIn('strict-transport-security', headers)                # 내부망 이름에는 HSTS 를 붙이지 않는다
+        response = client.post('/login', data={'username': 'kim', 'password': PASSWORD}, headers={'origin': 'https://localhost'})
+        self.assertEqual(response.headers['location'], '/')
+        self.assertIn('secure', response.headers['set-cookie'].lower())
+        self.assertEqual(client.get('/api/me').json()['name'], 'kim')
+        mixed = client.post('/logout', headers={'origin': 'http://localhost'})  # 스킴이 달라도 호스트가 같으면 같은 출처로 본다
+        self.assertEqual(mixed.headers['location'], '/login')
+
+    def test_tls_settings_and_certificate_names(self):
+        base = '[llm]\nbase_url = "http://x/v1"\nmodel = "m"\n[web]\n'
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / 'config.toml'
+            (Path(folder) / 'certs').mkdir()
+            (Path(folder) / 'certs' / 'cert.pem').write_text('cert')
+            (Path(folder) / 'certs' / 'key.pem').write_text('key')
+            config.write_text(base + 'tls_cert = "certs/cert.pem"\ntls_key = "certs/key.pem"\n', encoding='utf-8')
+            loaded = Settings.load(config).web
+            self.assertEqual((loaded.tls_cert, loaded.tls_key), (str(Path(folder) / 'certs' / 'cert.pem'), str(Path(folder) / 'certs' / 'key.pem')))
+            for text, expected in (('tls_cert = "certs/cert.pem"\n', '둘 다'), ('tls_cert = "certs/none.pem"\ntls_key = "certs/key.pem"\n', '파일이 없습니다')):
+                config.write_text(base + text, encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, expected):
+                    Settings.load(config)
+            config.write_text(base, encoding='utf-8')
+            self.assertEqual(Settings.load(config).web.tls_cert, '')
+        self.assertEqual(tlscert.subject_alt_names(['orin', 'orin'], ['10.0.0.5']), 'DNS:localhost,DNS:orin,IP:127.0.0.1,IP:10.0.0.5')
+        for names, ips in ((['bad name'], []), ([], ['not-an-ip']), (['a,DNS:evil'], [])):
+            with self.assertRaises(ValueError):
+                tlscert.subject_alt_names(names, ips)
 
     def test_login_failures_are_uniform_and_lock(self):
         client = self.client()

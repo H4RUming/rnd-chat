@@ -1,7 +1,8 @@
 """웹 채팅 서버:  python -m chat.web
 
 로그인한 사람만 쓸 수 있다. 외부에 공개할 것을 전제로 다음을 지킨다.
-- 127.0.0.1 에만 연다. 밖에서는 터널(Cloudflare 등)을 거쳐서만 들어온다.
+- 기본은 127.0.0.1 에만 연다. 밖에서는 터널(Cloudflare 등)을 거쳐서만 들어온다. 내부망에 직접 열 때는
+  설정의 tls_cert / tls_key 로 https 를 켠다.
 - 로그인·정적 파일 말고는 모두 세션이 있어야 한다. 세션은 서버 메모리에 두고 쿠키에는 무작위 토큰만 싣는다
   (HttpOnly, SameSite=Strict, https 면 Secure).
 - 상태를 바꾸는 요청은 Origin 이 같은 호스트여야 하고, API 는 전용 헤더까지 있어야 한다(CSRF 방지).
@@ -71,7 +72,8 @@ class SecurityHeaders:
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
             return await self.app(scope, receive, send)
-        https = scope.get('scheme') == 'https' or dict(scope['headers']).get(b'x-forwarded-proto') == b'https'
+        forwarded = dict(scope['headers']).get(b'x-forwarded-proto') == b'https'       # 앞단(터널)이 https 를 받았다
+        https = scope.get('scheme') == 'https' or forwarded
 
         async def wrapped(message):
             if message['type'] == 'http.response.start':
@@ -81,9 +83,12 @@ class SecurityHeaders:
                          # no-referrer 로 두면 브라우저가 같은 사이트의 폼 전송에도 Origin: null 을 보내 로그인이 막힌다(실측)
                          b'referrer-policy': b'same-origin', b'permissions-policy': b'camera=(), microphone=(), geolocation=()',
                          b'cache-control': b'no-store'}
-                if https:                # 아래 둘은 https 에서만 뜻이 있다(http 에서는 브라우저가 무시하고 경고를 낸다)
-                    extra[b'strict-transport-security'] = b'max-age=31536000'
+                if https:                # https 에서만 뜻이 있다(http 에서는 브라우저가 무시하고 경고를 낸다)
                     extra[b'cross-origin-opener-policy'] = b'same-origin'
+                if forwarded:
+                    # HSTS 는 공개 도메인(터널 뒤)에만 붙인다. 내부망 이름에 붙이면 그 이름의 다른 포트(http 서비스)까지
+                    # 브라우저가 https 로 바꿔 버린다.
+                    extra[b'strict-transport-security'] = b'max-age=31536000'
                 message = {**message, 'headers': headers + [(name, value) for name, value in extra.items() if name not in present]}
             await send(message)
         await self.app(scope, receive, wrapped)
@@ -361,10 +366,13 @@ def main() -> None:
         sys.exit('로그인 계정이 없습니다. config.toml 에 [[users]] 를 하나 이상 넣으세요(비밀번호 해시는 python -m chat.passwd).')
     if users.plaintext:
         log.warning('비밀번호를 평문으로 적은 계정이 있습니다: %s — python -m chat.passwd 로 해시를 만들어 바꾸기를 권합니다', ', '.join(users.plaintext))
-    if settings.web.host not in ('127.0.0.1', 'localhost', '::1'):
-        log.warning('[web] host 가 %s 입니다. 같은 망의 다른 기기에서 암호화 없이(http) 접속할 수 있습니다. 믿을 수 있는 내부망에서만 쓰세요.', settings.web.host)
+    tls = {'ssl_certfile': settings.web.tls_cert, 'ssl_keyfile': settings.web.tls_key} if settings.web.tls_cert else {}
+    if settings.web.host not in ('127.0.0.1', 'localhost', '::1') and not tls:
+        log.warning('[web] host 가 %s 인데 https 가 꺼져 있습니다. 같은 망의 다른 기기에서 암호화 없이(http) 접속하게 됩니다. '
+                    'tls_cert / tls_key 를 설정하세요(python -m chat.tlscert).', settings.web.host)
+    log.info('%s://%s:%s 에서 엽니다', 'https' if tls else 'http', settings.web.host, settings.web.port)
     uvicorn.run(create_app(settings, users), host=settings.web.host, port=settings.web.port, server_header=False,
-                proxy_headers=False, log_level='info')
+                proxy_headers=False, log_level='info', **tls)
 
 
 if __name__ == '__main__':

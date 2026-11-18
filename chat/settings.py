@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -35,6 +36,8 @@ class Web:
     max_question_chars: int = 4000
     trust_forwarded: bool = False        # Cloudflare 뒤에 둘 때만 true: 접속 IP 를 CF-Connecting-IP 에서 읽는다
     allowed_hosts: tuple[str, ...] = ('127.0.0.1', 'localhost')   # 이 이름으로 온 요청만 받는다(포트 제외)
+    tls_cert: str = ''                   # 인증서와 개인키 파일을 주면 https 로 연다(둘 다 있어야 한다)
+    tls_key: str = ''
 
 
 @dataclass(frozen=True)
@@ -83,7 +86,8 @@ class Settings:
                     session_hours=_number(web, 'session_hours', 12.0, 0.1, 720.0),
                     max_concurrent=int(_number(web, 'max_concurrent', 2, 1, 16)),
                     max_question_chars=int(_number(web, 'max_question_chars', 4000, 100, 100000)),
-                    trust_forwarded=_flag(web, 'trust_forwarded', False), allowed_hosts=_hosts(web)),
+                    trust_forwarded=_flag(web, 'trust_forwarded', False), allowed_hosts=_hosts(web),
+                    **_tls(web, appconfig.config_path(path).parent)),
             users=tuple(entry for entry in config.get('users', []) if isinstance(entry, dict)))
 
 
@@ -92,6 +96,23 @@ def _table(config: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f'설정 파일의 [{name}] 은 표(table)여야 합니다')
     return value
+
+
+def _tls(web: dict[str, Any], base: Path) -> dict[str, str]:
+    """[web] tls_cert / tls_key. 상대 경로는 설정 파일이 있는 폴더 기준이다."""
+    cert, key = str(web.get('tls_cert') or '').strip(), str(web.get('tls_key') or '').strip()
+    if not cert and not key:
+        return {}
+    if not (cert and key):
+        raise ValueError('설정 [web] tls_cert 와 tls_key 는 둘 다 있어야 합니다')
+    found = {}
+    for name, value in (('tls_cert', cert), ('tls_key', key)):
+        path = Path(value).expanduser()
+        path = path if path.is_absolute() else base / path
+        if not path.is_file():
+            raise ValueError(f'설정 [web] {name} 파일이 없습니다: {path}')
+        found[name] = str(path)
+    return found
 
 
 def _hosts(web: dict[str, Any]) -> tuple[str, ...]:
