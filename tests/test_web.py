@@ -122,6 +122,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(client.get('/login').status_code, 200)
         self.assertEqual(client.get('/static/style.css').status_code, 200)
         self.assertEqual(client.get('/static/app.js').headers['content-type'], 'text/javascript; charset=utf-8')
+        self.assertEqual(client.get('/static/theme.js').status_code, 200)
+        self.assertNotIn('<script>', client.get('/login').text)               # 인라인 스크립트 없이 파일로만 싣는다
         for name in ('index.html', '..%2Fweb.py', 'nothing.js'):
             self.assertEqual(client.get('/static/' + name).status_code, 404, name)
         self.assertEqual(self.calls, [])
@@ -143,7 +145,7 @@ class WebTests(unittest.TestCase):
         client = self.client()
         page = client.get('/login?error=1').text
         self.assertIn('이름 또는 비밀번호가 맞지 않습니다', page)
-        self.assertNotIn('<script', page)
+        self.assertNotIn('<script>', page)
         self.assertNotIn('error', client.get('/login?error=<script>alert(1)</script>').text.split('<form')[1].split('<label')[0])
         post = lambda name, password, headers=ORIGIN: client.post('/login', data={'username': name, 'password': password}, headers=headers)
         self.assertEqual(post('kim', PASSWORD, {}).headers['location'], '/login?error=origin')            # Origin 없는 요청
@@ -170,7 +172,7 @@ class WebTests(unittest.TestCase):
         self.assertNotIn('lee', cookie)                                       # 쿠키에는 무작위 토큰만
         secure = self.client().post('/login', data={'username': 'kim', 'password': PASSWORD}, headers={**ORIGIN, 'x-forwarded-proto': 'https'})
         self.assertIn('secure', secure.headers['set-cookie'].lower())
-        self.assertEqual(client.get('/api/me').json()['name'], 'lee')
+        self.assertEqual((client.get('/api/me').json()['name'], client.get('/api/me').json()['model']), ('lee', 'hai'))
         self.assertEqual(client.get('/').status_code, 200)
         self.assertEqual(client.get('/login').headers['location'], '/')
         self.assertEqual(client.post('/logout').headers['location'], '/')     # Origin 없는 로그아웃은 무시
@@ -198,10 +200,25 @@ class WebTests(unittest.TestCase):
         self.assertEqual([m['role'] for m in self.calls[1]], ['user', 'assistant', 'user'])              # 앞선 문답이 함께 간다
         listing = kim.get('/api/conversations').json()['conversations']
         self.assertEqual([(item['id'], item['title']) for item in listing], [(conversation_id, '인공지능 과제가 몇 건이야?')])
+        self.assertGreater(listing[0]['updated'], 0)
         stored = kim.get('/api/conversations/' + conversation_id)
         self.assertEqual(len(stored.json()['messages']), 4)
         self.assertEqual(stored.headers['content-type'], 'application/json')                              # 답 속의 HTML 은 글자로만 오간다
+        # 다시 생성: 마지막 질문을 다시 묻고 답만 바꾼다
+        response = kim.post('/api/chat', json={'conversation_id': conversation_id, 'regenerate': True}, headers=API)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.calls[2], self.calls[1])                        # 같은 대화 내용으로 다시 물음
+        messages = kim.get('/api/conversations/' + conversation_id).json()['messages']
+        self.assertEqual((len(messages), messages[-2]['content'], messages[-1]['content'][:4]), (4, '부처별로는?', '답 3:'))
+        self.assertEqual(kim.post('/api/chat', json={'regenerate': True}, headers=API).status_code, 400)
+        # 제목 바꾸기
+        renamed = kim.patch('/api/conversations/' + conversation_id, json={'title': '  AI   과제 현황 '}, headers=API)
+        self.assertEqual(renamed.json(), {'id': conversation_id, 'title': 'AI 과제 현황'})
+        self.assertEqual(kim.get('/api/conversations').json()['conversations'][0]['title'], 'AI 과제 현황')
+        self.assertEqual(kim.patch('/api/conversations/' + conversation_id, json={'title': ' '}, headers=API).status_code, 400)
+        self.assertEqual(kim.patch('/api/conversations/' + conversation_id, json={'title': 'x'}).status_code, 403)
         lee = self.client('lee', 'plain-password')
+        self.assertEqual(lee.patch('/api/conversations/' + conversation_id, json={'title': '남의 것'}, headers=API).status_code, 404)
         self.assertEqual(lee.get('/api/conversations').json()['conversations'], [])
         self.assertEqual(lee.get('/api/conversations/' + conversation_id).status_code, 404)              # 남의 대화는 id 를 알아도 못 본다
         self.assertEqual(self.ask(lee, '이어서', conversation_id)[0].status_code, 404)

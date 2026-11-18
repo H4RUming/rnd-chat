@@ -19,10 +19,15 @@ class ScriptedLlm:
     def __init__(self, replies):
         self.replies = list(replies)
         self.requests = []
+        self.streamed = []
 
-    async def complete(self, messages, tools=None):
+    async def complete(self, messages, tools=None, on_text=None):
         self.requests.append((json.loads(json.dumps(messages)), tools))
         reply = self.replies.pop(0)
+        self.streamed.append(on_text is not None)
+        if on_text is not None:
+            for piece in reply.get('pieces', [reply.get('content', '')] if reply.get('content') else []):
+                await on_text(piece)
         return {'content': reply.get('content', ''), 'tool_calls': reply.get('tool_calls', []),
                 'finish_reason': reply.get('finish_reason', 'tool_calls' if reply.get('tool_calls') else 'stop'),
                 'usage': {'prompt_tokens': 10, 'completion_tokens': 5}}
@@ -66,8 +71,22 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(outcome.messages[3], {'role': 'tool', 'tool_call_id': 'c1', 'content': '{"total": 3}'})
         self.assertEqual(len(original), 2)                               # 넘겨받은 대화는 고치지 않는다
         self.assertEqual(llm.requests[1][0][-1]['role'], 'tool')         # 두 번째 요청에 도구 결과가 실린다
-        self.assertEqual([e['type'] for e in events], ['tool_call', 'tool_result', 'answer'])
+        self.assertEqual([e['type'] for e in events], ['tool_call', 'tool_result', 'delta', 'answer'])
         self.assertEqual(outcome.usage, {'prompt_tokens': 20, 'completion_tokens': 10})
+
+    def test_text_is_streamed_only_when_someone_listens_and_interim_text_is_withdrawn(self):
+        hub = FakeHub({'search': tools.ToolResult('found')})
+        replies = lambda: [{'content': '먼저 찾아보겠습니다.', 'tool_calls': [call('search', {})]}, {'content': '답입니다.', 'pieces': ['답', '입니다.']}]
+        events = []
+        llm = ScriptedLlm(replies())
+        outcome, _ = run(llm, hub, listener=events.append)
+        self.assertEqual(llm.streamed, [True, True])
+        self.assertEqual([(e['type'], e.get('text')) for e in events if e['type'] in ('delta', 'reset', 'answer')],
+                         [('delta', '먼저 찾아보겠습니다.'), ('reset', None), ('delta', '답'), ('delta', '입니다.'), ('answer', '답입니다.')])
+        self.assertEqual(outcome.answer, '답입니다.')
+        quiet = ScriptedLlm(replies())
+        self.assertEqual(run(quiet, hub)[0].answer, '답입니다.')
+        self.assertEqual(quiet.streamed, [False, False])                 # 듣는 쪽이 없으면 스트리밍하지 않는다
 
     def test_errors_and_bad_arguments_go_back_to_the_model_as_text(self):
         hub = FakeHub({'search': tools.ToolResult('NTIS 승인키가 등록되지 않았습니다', is_error=True)})
@@ -131,6 +150,33 @@ class LlmClientTests(unittest.TestCase):
         asyncio.run(self.client(handler).complete([{'role': 'user', 'content': 'hi'}]))
         self.assertIsNone(seen['auth'])
         self.assertNotIn('tools', seen['body'])
+
+    def test_streaming_assembles_text_and_tool_calls(self):
+        def sse(*chunks):
+            return ''.join(f'data: {json.dumps(chunk, ensure_ascii=False)}\n\n' for chunk in chunks) + 'data: [DONE]\n\n'
+        seen = {}
+
+        def handler(request):
+            seen['body'] = json.loads(request.content)
+            if seen['body']['messages'][0]['content'] == 'tool':
+                return httpx.Response(200, text=sse(
+                    {'choices': [{'delta': {'role': 'assistant', 'reasoning_content': '생각'}}]},
+                    {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'c9', 'function': {'name': 'count_projects', 'arguments': ''}}]}}]},
+                    {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'arguments': '{"group_by": '}}]}}]},
+                    {'choices': [{'delta': {'tool_calls': [{'index': 0, 'function': {'arguments': '"year"}'}}, {'index': 1, 'function': {'name': 'search', 'arguments': '{}'}}]}}]},
+                    {'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]}, {'choices': [], 'usage': {'prompt_tokens': 9, 'completion_tokens': 4}}))
+            return httpx.Response(200, text=': ping\n\n' + sse({'choices': [{'delta': {'content': '안녕'}}]}, {'choices': [{'delta': {'content': '하세요'}}]},
+                                                                {'choices': [{'delta': {}, 'finish_reason': 'stop'}]}) + 'data: not json\n\n')
+        pieces = []
+        reply = asyncio.run(self.client(handler).complete([{'role': 'user', 'content': 'text'}], on_text=pieces.append))
+        self.assertEqual((pieces, reply['content'], reply['tool_calls'], reply['finish_reason']), (['안녕', '하세요'], '안녕하세요', [], 'stop'))
+        self.assertEqual((seen['body']['stream'], seen['body']['stream_options']), (True, {'include_usage': True}))
+        reply = asyncio.run(self.client(handler).complete([{'role': 'user', 'content': 'tool'}], on_text=pieces.append))
+        self.assertEqual(reply['tool_calls'], [{'id': 'c9', 'name': 'count_projects', 'arguments': '{"group_by": "year"}'},
+                                               {'id': 'call_1', 'name': 'search', 'arguments': '{}'}])
+        self.assertEqual((reply['content'], reply['usage']), ('', {'prompt_tokens': 9, 'completion_tokens': 4}))
+        with self.assertRaisesRegex(LlmError, 'HTTP 503'):
+            asyncio.run(self.client(lambda r: httpx.Response(503, text='busy')).complete([{'role': 'user', 'content': 'x'}], on_text=pieces.append))
 
     def test_failures_become_llm_errors(self):
         def refuse(request):

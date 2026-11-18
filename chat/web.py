@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import OrderedDict
+import contextlib
 import html
 import json
 import logging
@@ -40,7 +41,8 @@ log = logging.getLogger('rnd-chat')
 COOKIE = 'rnd_session'
 API_HEADER, API_HEADER_VALUE = 'x-requested-with', 'rnd-chat'
 STATIC = Path(__file__).resolve().parent / 'static'
-STATIC_FILES = {'app.js': 'text/javascript; charset=utf-8', 'style.css': 'text/css; charset=utf-8'}
+STATIC_FILES = {'app.js': 'text/javascript; charset=utf-8', 'theme.js': 'text/javascript; charset=utf-8',
+                'style.css': 'text/css; charset=utf-8'}
 MAX_CONVERSATIONS, MAX_MESSAGES, CONTEXT_MESSAGES = 50, 200, 20
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -48,11 +50,13 @@ LOGIN_ERRORS = {'1': '이름 또는 비밀번호가 맞지 않습니다.', 'lock
                 'origin': '요청을 확인하지 못했습니다. 이 페이지에서 다시 로그인해 주세요.'}
 LOGIN_PAGE = '''<!doctype html>
 <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>로그인 · R&amp;D 검색</title><link rel="stylesheet" href="/static/style.css"></head>
-<body class="login"><main><h1>R&amp;D 검색</h1>
+<title>로그인 · R&amp;D 검색</title><script src="/static/theme.js"></script><link rel="stylesheet" href="/static/style.css"></head>
+<body class="login"><main>
+<div class="brand"><span class="mark" aria-hidden="true"></span><h1>R&amp;D 검색</h1></div>
+<p class="lead">지원사업 공고와 국가R&amp;D 과제를 찾아 정리해 드립니다.</p>
 <form method="post" action="/login" autocomplete="on">{error}
-<label>이름<input name="username" autocomplete="username" maxlength="64" required autofocus></label>
-<label>비밀번호<input name="password" type="password" autocomplete="current-password" maxlength="256" required></label>
+<label><span>이름</span><input name="username" autocomplete="username" maxlength="64" required autofocus></label>
+<label><span>비밀번호</span><input name="password" type="password" autocomplete="current-password" maxlength="256" required></label>
 <button type="submit">로그인</button></form></main></body></html>'''
 
 Runner = Callable[[list[dict[str, Any]], agent.Listener], Awaitable[agent.Outcome]]
@@ -76,9 +80,10 @@ class SecurityHeaders:
                 extra = {b'content-security-policy': CSP.encode(), b'x-content-type-options': b'nosniff', b'x-frame-options': b'DENY',
                          # no-referrer 로 두면 브라우저가 같은 사이트의 폼 전송에도 Origin: null 을 보내 로그인이 막힌다(실측)
                          b'referrer-policy': b'same-origin', b'permissions-policy': b'camera=(), microphone=(), geolocation=()',
-                         b'cross-origin-opener-policy': b'same-origin', b'cache-control': b'no-store'}
-                if https:
+                         b'cache-control': b'no-store'}
+                if https:                # 아래 둘은 https 에서만 뜻이 있다(http 에서는 브라우저가 무시하고 경고를 낸다)
                     extra[b'strict-transport-security'] = b'max-age=31536000'
+                    extra[b'cross-origin-opener-policy'] = b'same-origin'
                 message = {**message, 'headers': headers + [(name, value) for name, value in extra.items() if name not in present]}
             await send(message)
         await self.app(scope, receive, wrapped)
@@ -98,6 +103,20 @@ class Conversations:
 
     def delete(self, user: str, conversation_id: str) -> bool:
         return self._data.get(user, {}).pop(conversation_id, None) is not None
+
+    def rename(self, user: str, conversation_id: str, title: str) -> bool:
+        item = self.get(user, conversation_id)
+        if item is not None:
+            item['title'] = title
+        return item is not None
+
+    def replace_answer(self, user: str, conversation_id: str, answer: str) -> dict[str, Any]:
+        """마지막 답을 새 답으로 바꾼다(다시 생성)."""
+        item = self._data[user][conversation_id]
+        item['messages'][-1] = {'role': 'assistant', 'content': answer}
+        item['updated'] = time.time()
+        self._data[user].move_to_end(conversation_id)
+        return item
 
     def append(self, user: str, conversation_id: str | None, question: str, answer: str) -> dict[str, Any]:
         mine = self._data.setdefault(user, OrderedDict())
@@ -212,19 +231,29 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return session
         return JSONResponse({'name': session.user, 'servers': [{'name': server.name, 'ok': server.name not in hub.unavailable}
                                                               for server in hub.servers] if state['refreshed'] else [],
-                             'max_question_chars': web.max_question_chars})
+                             'model': settings.llm.model, 'max_question_chars': web.max_question_chars})
 
     async def conversation_list(request: Request) -> Response:
         session = api_guard(request, write=False)
         return session if isinstance(session, Response) else JSONResponse({'conversations': conversations.list(session.user)})
 
     async def conversation(request: Request) -> Response:
-        session = api_guard(request, write=request.method == 'DELETE')
+        session = api_guard(request, write=request.method != 'GET')
         if isinstance(session, Response):
             return session
         conversation_id = request.path_params['conversation_id']
         if request.method == 'DELETE':
             return JSONResponse({'deleted': conversations.delete(session.user, conversation_id)})
+        if request.method == 'PATCH':
+            try:
+                title = ' '.join(str(json.loads(await request.body()).get('title') or '').split())[:80]
+            except (ValueError, AttributeError):
+                title = ''
+            if not title:
+                return JSONResponse({'error': '제목은 1~80자여야 합니다.'}, status_code=400)
+            if not conversations.rename(session.user, conversation_id, title):
+                return JSONResponse({'error': '없는 대화입니다.'}, status_code=404)
+            return JSONResponse({'id': conversation_id, 'title': title})
         item = conversations.get(session.user, conversation_id)     # 남의 대화는 id 를 알아도 볼 수 없다(계정별로 따로 둔다)
         return JSONResponse(item) if item else JSONResponse({'error': '없는 대화입니다.'}, status_code=404)
 
@@ -236,17 +265,23 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             body = json.loads(await request.body() or b'{}')
             question = str(body.get('message') or '').strip()
             conversation_id = body.get('conversation_id')
+            regenerate = body.get('regenerate') is True
         except (ValueError, AttributeError):
             return JSONResponse({'error': '요청 형식이 잘못되었습니다.'}, status_code=400)
-        if not question or len(question) > web.max_question_chars:
-            return JSONResponse({'error': f'질문은 1~{web.max_question_chars}자여야 합니다.'}, status_code=400)
         previous = conversations.get(session.user, conversation_id) if isinstance(conversation_id, str) else None
         if conversation_id and previous is None:
             return JSONResponse({'error': '없는 대화입니다.'}, status_code=404)
+        earlier = previous['messages'] if previous else []
+        if regenerate:                               # 마지막 질문을 다시 묻고, 그 답을 새 답으로 바꾼다
+            if len(earlier) < 2:
+                return JSONResponse({'error': '다시 만들 답이 없습니다.'}, status_code=400)
+            question, earlier = earlier[-2]['content'], earlier[:-2]
+        elif not question or len(question) > web.max_question_chars:
+            return JSONResponse({'error': f'질문은 1~{web.max_question_chars}자여야 합니다.'}, status_code=400)
         if session.busy:
             return JSONResponse({'error': '앞선 질문에 답하는 중입니다.'}, status_code=409)
         session.busy = True
-        history = (previous['messages'][-CONTEXT_MESSAGES:] if previous else []) + [{'role': 'user', 'content': question}]
+        history = earlier[-CONTEXT_MESSAGES:] + [{'role': 'user', 'content': question}]
         queue: asyncio.Queue = asyncio.Queue()
 
         async def work() -> None:
@@ -255,7 +290,10 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                     await queue.put({'type': 'queued'})
                 async with gate:
                     outcome = await run(history, queue.put)
-                item = conversations.append(session.user, previous['id'] if previous else None, question, outcome.answer)
+                if regenerate:
+                    item = conversations.replace_answer(session.user, previous['id'], outcome.answer)
+                else:
+                    item = conversations.append(session.user, previous['id'] if previous else None, question, outcome.answer)
                 await queue.put({'type': 'done', 'conversation_id': item['id'], 'title': item['title']})
             except LlmError as exc:
                 await queue.put({'type': 'error', 'message': str(exc)})
@@ -285,9 +323,24 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
 
     routes = [Route('/', index), Route('/static/{name}', static), Route('/login', login_page), Route('/login', login, methods=['POST']),
               Route('/logout', logout, methods=['POST']), Route('/api/me', me), Route('/api/conversations', conversation_list),
-              Route('/api/conversations/{conversation_id}', conversation, methods=['GET', 'DELETE']),
+              Route('/api/conversations/{conversation_id}', conversation, methods=['GET', 'DELETE', 'PATCH']),
               Route('/api/chat', chat, methods=['POST'])]
-    return Starlette(routes=routes, middleware=[Middleware(SecurityHeaders),
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async def warm() -> None:                    # 첫 질문 전에 자료 서버 상태를 알아 둔다(실패해도 서버는 뜬다)
+            try:
+                await hub.refresh()
+                state['refreshed'] = time.monotonic()
+            except Exception:
+                log.exception('MCP 서버 목록을 받지 못했습니다')
+        task = asyncio.create_task(warm()) if runner is None else None
+        yield
+        if task and not task.done():
+            task.cancel()
+        if state['llm'] is not None:
+            await state['llm'].close()
+
+    return Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(SecurityHeaders),
                                                 Middleware(TrustedHostMiddleware, allowed_hosts=list(web.allowed_hosts))])
 
 
@@ -297,6 +350,8 @@ def main() -> None:
     parser.add_argument('--config', type=Path, default=None)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    for noisy in ('httpx', 'mcp'):                   # 자료 서버 호출마다 한 줄씩 남기지 않는다
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         settings = Settings.load(args.config)
         users = Users(list(settings.users))
@@ -307,7 +362,7 @@ def main() -> None:
     if users.plaintext:
         log.warning('비밀번호를 평문으로 적은 계정이 있습니다: %s — python -m chat.passwd 로 해시를 만들어 바꾸기를 권합니다', ', '.join(users.plaintext))
     if settings.web.host not in ('127.0.0.1', 'localhost', '::1'):
-        log.warning('[web] host 가 %s 입니다. 이 장비 밖에서 직접 붙을 수 있습니다(TLS 없이).', settings.web.host)
+        log.warning('[web] host 가 %s 입니다. 같은 망의 다른 기기에서 암호화 없이(http) 접속할 수 있습니다. 믿을 수 있는 내부망에서만 쓰세요.', settings.web.host)
     uvicorn.run(create_app(settings, users), host=settings.web.host, port=settings.web.port, server_header=False,
                 proxy_headers=False, log_level='info')
 

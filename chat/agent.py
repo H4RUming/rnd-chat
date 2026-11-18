@@ -67,8 +67,12 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
             if result is not None:
                 await result
 
+    async def on_text(text: str) -> None:
+        await emit({'type': 'delta', 'text': text})
+    stream = {'on_text': on_text} if listener else {}        # 듣는 쪽이 있을 때만 스트리밍으로 받는다
+
     for step in range(1, limits.max_steps + 1):
-        reply = await llm.complete(messages, tools)
+        reply = await llm.complete(messages, tools, **stream)
         for key in usage:
             usage[key] += int(reply['usage'].get(key) or 0)
         calls = reply['tool_calls']
@@ -80,6 +84,8 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
         messages.append({'role': 'assistant', 'content': reply['content'] or None,
                          'tool_calls': [{'id': call['id'], 'type': 'function',
                                          'function': {'name': call['name'], 'arguments': call['arguments'] or '{}'}} for call in calls]})
+        if reply['content']:
+            await emit({'type': 'reset'})                     # 도구를 부르기 전에 한 말은 답이 아니다
         images: list[tuple[str, str, str]] = []
         for call in calls:
             try:
@@ -107,7 +113,7 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                 {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{data}'}} for _, mime, data in shown]})
     # 왕복 상한에 걸렸다: 도구 없이 지금까지 찾은 것으로 마무리하게 한다
     messages.append({'role': 'user', 'content': '도구를 더 부르지 말고, 지금까지 찾은 내용만으로 답을 마무리하세요. 확인하지 못한 부분은 그렇다고 밝히세요.'})
-    reply = await llm.complete(messages)
+    reply = await llm.complete(messages, **stream)
     for key in usage:
         usage[key] += int(reply['usage'].get(key) or 0)
     messages.append({'role': 'assistant', 'content': reply['content']})
