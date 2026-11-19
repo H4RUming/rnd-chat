@@ -21,9 +21,10 @@ class ScriptedLlm:
         self.requests = []
         self.streamed = []
 
-    async def complete(self, messages, tools=None, on_text=None, thinking=None):
+    async def complete(self, messages, tools=None, on_text=None, thinking=None, max_tokens=None):
         self.requests.append((json.loads(json.dumps(messages)), tools))
         self.thinking = getattr(self, 'thinking', []) + [thinking]
+        self.limits = getattr(self, 'limits', []) + [max_tokens]
         reply = self.replies.pop(0)
         self.streamed.append(on_text is not None)
         if on_text is not None:
@@ -110,6 +111,13 @@ class AgentTests(unittest.TestCase):
         self.assertEqual((picture_turn['role'], len(picture_turn['content'])), ('user', 3))         # 안내 글 + 그림 2장
         self.assertIn('나머지 1장은 생략', picture_turn['content'][0]['text'])
         self.assertEqual(picture_turn['content'][1]['image_url']['url'], 'data:image/png;base64,QUJD')
+        # 질문 하나에 넘기는 합에도 상한이 있다: 다 쓰면 뒤의 결과는 짧게만 넘긴다(모델이 읽을 수 있는 양을 넘지 않게)
+        llm = ScriptedLlm([{'tool_calls': [call('read', {'n': 1}, 'a'), call('read', {'n': 2}, 'b')]}, {'content': '끝'}])
+        outcome, _ = run(llm, hub, limits=Limits(tool_result_chars=4000, turn_result_chars=10000))
+        self.assertTrue(outcome.messages[3]['content'].startswith('가' * 4000) and outcome.messages[4]['content'].startswith('가' * 4000))
+        llm = ScriptedLlm([{'tool_calls': [call('read', {'n': 1}, 'a'), call('read', {'n': 2}, 'b'), call('read', {'n': 3}, 'c')]}, {'content': '끝'}])
+        outcome, _ = run(llm, hub, limits=Limits(tool_result_chars=4000, turn_result_chars=10000))
+        self.assertIn('2000자에서 잘랐습니다', outcome.messages[5]['content'])
         outcome, _ = run(ScriptedLlm([{'tool_calls': [call('view', {})]}, {'content': '끝'}]), hub, limits=Limits(max_images=0))
         self.assertEqual([m['role'] for m in outcome.messages], ['system', 'user', 'assistant', 'tool', 'assistant'])
 
@@ -142,6 +150,142 @@ class ThinkingTests(unittest.TestCase):
         llm = ScriptedLlm([{'content': '쓰다가 끊긴 답', 'finish_reason': 'length'}])       # 글이 있으면 그대로 내놓는다
         outcome, _ = run(llm, FakeHub({}))
         self.assertEqual((outcome.answer, outcome.stopped, llm.thinking), ('쓰다가 끊긴 답', 'length', [None]))
+
+
+    def test_thinking_is_used_for_planning_only_and_kept_short(self):
+        hub = FakeHub({'search_projects': tools.ToolResult('{"total": 3}')})
+        replies = [{'tool_calls': [call('search_projects', {'query_text': '드론|무인기'})]}, {'content': '3건입니다.'}]
+        llm = ScriptedLlm(replies)
+        llm.settings = SimpleNamespace(thinking='on')
+        run(llm, hub, limits=Limits(thinking_steps=1, thinking_tokens=4000))
+        # 첫 단계(무엇을 어떻게 찾을지)만 생각하고 길이를 묶는다. 결과를 읽고 답하는 단계는 생각 없이 한다
+        self.assertEqual((llm.thinking, llm.limits), ([None, False], [4000, None]))
+        llm = ScriptedLlm(replies)
+        llm.settings = SimpleNamespace(thinking='on')
+        run(llm, hub, limits=Limits(thinking_steps=0))                    # 0: 모든 단계에서 제한 없이 생각한다
+        self.assertEqual((llm.thinking, llm.limits), ([None, None], [None, None]))
+        llm = ScriptedLlm(replies)
+        llm.settings = SimpleNamespace(thinking='off')
+        run(llm, hub)
+        self.assertEqual((llm.thinking, llm.limits), ([None, None], [None, None]))
+
+    def test_thinking_that_ends_empty_or_runs_out_is_asked_again_without_thinking(self):
+        for first in ({'content': '', 'finish_reason': 'stop'},                       # 속으로만 따져 보고 끝났다
+                      {'content': '쓰다가 끊긴 답', 'finish_reason': 'length'}):       # 생각에 길이를 다 썼다
+            llm = ScriptedLlm([first, {'content': '답입니다.'}])
+            llm.settings = SimpleNamespace(thinking='on')
+            events = []
+            outcome, _ = run(llm, FakeHub({}), listener=events.append)
+            self.assertEqual((outcome.answer, outcome.steps, outcome.stopped), ('답입니다.', 1, ''))
+            self.assertEqual((llm.thinking, llm.limits), ([None, False], [4000, None]))
+            self.assertIn('reset', [event['type'] for event in events])
+
+    def test_earlier_searches_are_described_with_how_much_was_seen(self):
+        turns = [[{'name': 'search_projects', 'args': {'query_text': '양자컴퓨팅', 'limit': 10, 'sort': ''},
+                   'summary': {'total': 2689, 'items': [{'n': n} for n in range(8)], 'more': 2}},
+                  {'name': 'get_project', 'args': {'project_number': '1'}, 'summary': {}},
+                  {'name': 'search_notices', 'args': {'query': 'AI'}, 'is_error': True, 'summary': {'error': '오류'}}],
+                 [{'name': 'count_projects', 'args': {'group_by': 'year'}, 'summary': {'total': 5}}]]
+        note = agent.earlier_searches(turns)
+        self.assertIn('search_projects(query_text=양자컴퓨팅, limit=10) → 전체 2689건 중 10건만 봄', note)
+        self.assertIn('count_projects(group_by=year) → 전체 5건', note)
+        self.assertNotIn('get_project', note)
+        self.assertNotIn('search_notices', note)
+        self.assertIn('다시 검색', note)
+        self.assertEqual(agent.earlier_searches([[], [{'name': 'get_project', 'args': {}, 'summary': {}}]]), '')
+
+
+class ReviewAllTests(unittest.TestCase):
+    """전체 확인: 모든 쪽을 넘기며 조건에 맞는 자료만 고른다."""
+
+    def hub(self, count, fail_at=None):
+        records = [{'title': f'과제 {n}', 'project_number': str(1000 + n), 'url': f'https://www.ntis.go.kr/p?id={n}', 'year': 2025,
+                    'summary': '드론 방제' if n % 3 == 0 else '기타', 'government_funds': 5, 'government_funds_text': '5원'} for n in range(count)]
+
+        def search(arguments):
+            offset, limit = arguments.get('offset', 0), arguments.get('limit', 10)
+            if fail_at is not None and offset >= fail_at:
+                return tools.ToolResult('NTIS 가 답하지 않았습니다', is_error=True)
+            page = records[offset:offset + limit]
+            following = offset + len(page)
+            return tools.ToolResult(json.dumps({'total': count, 'items': page, 'next_offset': following if following < count else None,
+                                                'related_terms': {'query_text': [{'term': '무인기', 'uses': 9}]}}, ensure_ascii=False))
+        return FakeHub({'search_projects': search})
+
+    def test_every_page_is_read_and_only_matching_items_come_back(self):
+        from chat import sweep
+        hub = self.hub(250)
+        seen = []
+
+        class Judge:                         # 목록에서 '드론 방제'가 든 줄의 번호를 고르는 가짜 모델
+            async def complete(self, messages, tools=None, on_text=None, thinking=None, max_tokens=None):
+                lines = messages[1]['content'].split('자료 ')[1].splitlines()[1:]
+                seen.append((len(lines), thinking))
+                return {'content': json.dumps([number for number, line in enumerate(lines, 1) if '드론 방제' in line]), 'tool_calls': [], 'finish_reason': 'stop', 'usage': {}}
+        progress = []
+        result = asyncio.run(sweep.review_all(Judge(), hub, {'tool': 'search_projects', 'arguments': {'query_text': '드론', 'limit': 5, 'offset': 40},
+                                                             'criteria': '드론 방제'}, progress=lambda done, total: progress.append((done, total))))
+        answer = json.loads(result.text)
+        self.assertEqual([call[1] for call in hub.calls], [{'query_text': '드론', 'limit': 100, 'offset': offset} for offset in (0, 100, 200)])   # 받은 limit·offset 은 버리고 끝까지 넘긴다
+        self.assertEqual((answer['total'], answer['checked'], answer['matched'], answer['complete']), (250, 250, 84, True))
+        self.assertEqual(len(answer['items']), 84)
+        self.assertEqual(answer['items'][1], {'title': '과제 3', 'project_number': '1003', 'url': 'https://www.ntis.go.kr/p?id=3', 'year': 2025,
+                                              'government_funds_text': '5원', 'summary': '드론 방제'})
+        self.assertEqual(answer['related_terms'], {'query_text': [{'term': '무인기', 'uses': 9}]})          # 첫 쪽의 추천은 그대로 전한다
+        self.assertEqual((sum(size for size, _ in seen), {thinking for _, thinking in seen}), (250, {False}))
+        self.assertEqual((progress[-1], result.summary), ((250, 250), {'total': 250, 'checked': 250, 'matched': 84}))
+
+    def test_the_same_project_registered_for_several_years_is_counted_once(self):
+        from chat import sweep
+        rows = [{'title': '농업용 드론', 'organization': '가 대학', 'year': year, 'url': f'https://www.ntis.go.kr/p?id={year}'} for year in (2026, 2025, 2024)]
+        rows.append({'title': '농업용 드론', 'organization': '나 연구원', 'year': 2025, 'url': 'https://www.ntis.go.kr/p?id=9'})
+        hub = FakeHub({'search_projects': tools.ToolResult(json.dumps({'total': 4, 'items': rows, 'next_offset': None}, ensure_ascii=False))})
+
+        class Everything:
+            async def complete(self, messages, tools=None, on_text=None, thinking=None, max_tokens=None):
+                return {'content': '[1, 2, 3, 4]', 'tool_calls': [], 'finish_reason': 'stop', 'usage': {}}
+        answer = json.loads(asyncio.run(sweep.review_all(Everything(), hub, {'tool': 'search_projects', 'arguments': {}, 'criteria': '드론'})).text)
+        self.assertEqual((answer['checked'], answer['matched'], answer['matched_records']), (4, 2, 4))
+        self.assertEqual([(item['organization'], item.get('years')) for item in answer['items']], [('가 대학', [2024, 2025, 2026]), ('나 연구원', None)])
+        self.assertIn('2개 과제', answer['caution'])
+
+    def test_limits_failures_and_unreadable_judgements_are_reported_not_hidden(self):
+        from chat import sweep
+
+        class Mute:
+            async def complete(self, messages, tools=None, on_text=None, thinking=None, max_tokens=None):
+                return {'content': '잘 모르겠습니다', 'tool_calls': [], 'finish_reason': 'stop', 'usage': {}}
+        ask = {'tool': 'search_projects', 'arguments': {'query_text': '드론'}, 'criteria': '드론 방제'}
+        answer = json.loads(asyncio.run(sweep.review_all(Mute(), self.hub(250), ask, max_items=200)).text)
+        self.assertEqual((answer['checked'], answer['matched'], answer['complete'], len(answer['items']), answer['items_not_shown']), (200, 200, False, 150, 50))
+        for expected in ('확인 상한(200건)', '가리지 못해', '앞의 150건만'):
+            self.assertIn(expected, answer['caution'])
+        answer = json.loads(asyncio.run(sweep.review_all(Mute(), self.hub(250, fail_at=100), ask)).text)
+        self.assertEqual((answer['checked'], answer['complete']), (100, False))
+        self.assertIn('중간에 오류', answer['caution'])
+        self.assertTrue(asyncio.run(sweep.review_all(Mute(), self.hub(250, fail_at=0), ask)).is_error)
+        for bad in ({'tool': 'get_project', 'arguments': {}, 'criteria': 'x'}, {'tool': 'search_projects', 'arguments': {}, 'criteria': ''},
+                    {'tool': 'search_projects', 'arguments': '망가진 글', 'criteria': 'x'}):
+            self.assertTrue(asyncio.run(sweep.review_all(Mute(), self.hub(3), bad)).is_error)
+
+    def test_the_agent_offers_the_tool_and_reports_progress(self):
+        hub = self.hub(120)
+        hub.tools = hub.results
+        llm = ScriptedLlm([{'tool_calls': [call('review_all', {'tool': 'search_projects', 'arguments': '{"query_text": "드론"}', 'criteria': '드론 방제'})]},
+                           {'content': '[1, 2]'}, {'content': '120건을 모두 확인했고 2건이 맞습니다.'}])
+        events = []
+        outcome, _ = run(llm, hub, listener=events.append)
+        self.assertIn('review_all', [tool['function']['name'] for tool in llm.requests[0][1]])
+        self.assertEqual(outcome.answer, '120건을 모두 확인했고 2건이 맞습니다.')
+        self.assertEqual([(event['checked'], event['total']) for event in events if event['type'] == 'tool_progress'], [(100, 120), (120, 120)])
+        done = next(event for event in events if event['type'] == 'tool_result')
+        self.assertEqual({key: done['summary'][key] for key in ('total', 'checked', 'matched')}, {'total': 120, 'checked': 120, 'matched': 2})
+        plain = ScriptedLlm([{'content': '끝'}])
+        run(plain, FakeHub({'count_projects': tools.ToolResult('{}')}))
+        self.assertNotIn('review_all', [tool['function']['name'] for tool in plain.requests[0][1]])     # 넘길 검색 도구가 없으면 내놓지 않는다
+        note = agent.earlier_searches([[{'name': 'review_all', 'args': {'tool': 'search_projects', 'arguments': 'query_text=드론'},
+                                         'summary': {'total': 120, 'checked': 120, 'matched': 2}}]])
+        self.assertIn('전체 120건 중 모두 확인, 조건에 맞은 것 2건', note)
 
 
 class StuckTests(unittest.TestCase):
@@ -188,6 +332,10 @@ class LlmClientTests(unittest.TestCase):
         self.assertEqual(seen['body']['chat_template_kwargs'], {'enable_thinking': False})
         asyncio.run(self.client(handler, thinking='off').complete([{'role': 'user', 'content': 'hi'}], thinking=True))
         self.assertEqual(seen['body']['chat_template_kwargs'], {'enable_thinking': True})
+        asyncio.run(self.client(handler, max_tokens=4096).complete([{'role': 'user', 'content': 'hi'}], max_tokens=100))
+        self.assertEqual(seen['body']['max_tokens'], 100)                     # 이번 답만 짧게 묶을 수 있다(설정값보다 크게는 안 된다)
+        asyncio.run(self.client(handler, max_tokens=4096).complete([{'role': 'user', 'content': 'hi'}], max_tokens=99999))
+        self.assertEqual(seen['body']['max_tokens'], 4096)
 
     def test_streaming_assembles_text_and_tool_calls(self):
         def sse(*chunks):

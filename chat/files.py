@@ -84,6 +84,21 @@ class FileStore:
         except (OSError, ValueError):
             return None
 
+    def list(self, user: str) -> list[dict[str, Any]]:
+        """이 계정에 보관된 파일의 정보(최근 것부터)."""
+        found = []
+        for path in self._folder(user).glob('*.json'):
+            try:
+                meta = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                continue
+            if isinstance(meta, dict) and meta.get('id') == path.stem and path.with_suffix('').is_file():
+                found.append(meta)
+        return sorted(found, key=lambda meta: -float(meta.get('created') or 0))
+
+    def has(self, user: str, file_id: Any) -> bool:
+        return bool(re.fullmatch(r'[A-Za-z0-9_-]{8,40}', str(file_id or ''))) and (self._folder(user) / str(file_id)).is_file()
+
     def delete(self, user: str, file_id: str) -> None:
         if re.fullmatch(r'[A-Za-z0-9_-]{8,40}', file_id or ''):
             for path in self._folder(user).glob(f'{file_id}*'):

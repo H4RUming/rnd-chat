@@ -6,7 +6,8 @@ const SVG = 'http://www.w3.org/2000/svg';
 const $ = (id) => document.getElementById(id);
 const root = document.documentElement;
 const state = {conversation: null, conversations: [], busy: false, controller: null, limit: 4000, name: '', attachments: [], uploading: 0,
-               sources: new Map()};          // sources: 이 대화에서 도구가 찾은 자료(번호 → 자료). 답의 [번호] 가 가리킨다.
+               sources: new Map(),           // sources: 이 대화에서 도구가 찾은 자료(번호 → 자료). 답의 [번호] 가 가리킨다.
+               view: null, title: '', kind: '', brief: null};     // view: 메뉴에서 연 화면(search | brief | tools). 없으면 대화를 보고 있다.
 const KIND = {pdf: 'PDF', docx: '워드 문서', xlsx: '엑셀', hwp: '한글 문서', hwpx: '한글 문서'};
 const hasTable = (text) => /\|[^\n]*\n\s*\|?\s*:?-{2,}/.test(text || '');
 const TOOLS = {
@@ -16,13 +17,15 @@ const TOOLS = {
   history_status: '이력 자료 범위 확인', search_projects: 'NTIS 과제 검색', count_projects: 'NTIS 과제 집계', get_project: 'NTIS 과제 상세 확인',
   search_results: 'NTIS 성과 검색', count_results: 'NTIS 성과 집계', search_reports: 'NTIS 연구보고서 검색', lookup_term: 'NTIS 용어사전 조회',
   lookup_class_code: 'NTIS 분류코드 조회', ntis_status: 'NTIS 연결 확인', create_document: '워드 문서 만들기', create_spreadsheet: '엑셀 파일 만들기',
-  edit_document: '문서 고치기', inspect_document: '문서 들여다보기',
+  edit_document: '문서 고치기', inspect_document: '문서 들여다보기', review_all: '전체 결과 확인', related_terms: 'NTIS 가까운 검색어',
 };
+const SERVERS = {bizinfo: '진행 중 공고', history: '공고 이력', ntis: 'NTIS 과제·성과', linkreader: '링크·첨부 읽기'};
 const ARGS = {
   query: '검색어', query_text: '검색어', limit: '개수', offset: '건너뛰기', year_from: '시작 연도', year_to: '끝 연도', ministry: '부처', organization: '기관',
   region: '지역', category: '분야', group_by: '묶는 기준', notice_id: '공고 번호', project_number: '과제 번호', url: '주소', kind: '종류', file_id: '파일',
   filename: '파일 이름', edits: '고칠 곳', sheets: '시트', blocks: '내용', markdown: '내용', status: '상태', sort: '정렬', search_in: '찾는 범위', table: '표',
   pages: '쪽', title: '제목', from_paragraph: '시작 문단', attachment_id: '첨부', publisher: '발행처', program: '사업', id: '번호', agency: '소관',
+  and_text: '함께 있는 말', criteria: '조건', tool: '검색 도구', arguments: '검색 조건', words: '낱말',
 };
 
 function el(tag, props, ...children) {
@@ -346,24 +349,25 @@ function groupOf(updated) {
   return '이전';
 }
 
-function renderList() {
-  const list = $('list'), words = $('filter').value.trim().toLowerCase();
+function renderList() {                                    // 브리핑은 여기에 섞지 않는다(메뉴의 브리핑 화면에 모인다)
+  const list = $('list');
   list.replaceChildren();
-  let group = null, shown = 0;
+  let group = null;
   for (const item of state.conversations) {
-    if (words && !item.title.toLowerCase().includes(words)) continue;
+    if (item.kind === 'brief') continue;
     const name = groupOf(item.updated);
     if (name !== group) { list.append(el('p', {class: 'group', text: name})); group = name; }
     list.append(conversationRow(item));
-    shown++;
   }
-  if (!shown && words) list.append(el('p', {class: 'none', text: '찾는 대화가 없습니다.'}));
+  for (const button of document.querySelectorAll('.side-nav [data-view]')) {
+    button.classList.toggle('current', button.dataset.view === state.view || (button.dataset.view === 'brief' && !state.view && state.kind === 'brief'));
+  }
 }
 
 function conversationRow(item) {
   const open = el('button', {type: 'button', class: 'open', title: item.title, text: item.title || '대화'});
   open.addEventListener('click', () => openConversation(item.id));
-  const row = el('div', {class: 'item' + (item.id === state.conversation ? ' current' : '')}, open);
+  const row = el('div', {class: 'item' + (item.id === state.conversation && !state.view ? ' current' : '')}, open);
   const rename = iconButton('edit', '제목 바꾸기', () => {
     const input = el('input', {class: 'rename', maxlength: '80', 'aria-label': '대화 제목'});
     input.value = item.title;
@@ -400,9 +404,11 @@ async function loadList() {
 }
 
 // ── 대화 화면 ───────────────────────────────────────────────────────────
-function setTitle(title) {
-  $('title').textContent = title || '새 대화';
-  document.title = title ? `${title} · R&D 검색` : 'R&D 검색';
+function setTitle(title) {                                 // 메뉴에서 연 화면을 보는 동안에는 그 화면의 이름이 제목이다
+  if (title !== undefined) state.title = title || '';
+  const shown = state.view ? VIEWS[state.view].title : state.title;
+  $('title').textContent = shown || '새 대화';
+  document.title = shown ? `${shown} · R&D 검색` : 'R&D 검색';
 }
 
 function nearBottom() {
@@ -504,7 +510,8 @@ function addActions(view) {
     if (hasTable(view.text)) view.actions.append(exportLink(view, 'xlsx', 'sheet', '표를 엑셀로 저장'));
   }
   for (const old of $('thread').querySelectorAll('.regenerate')) old.remove();     // 다시 생성은 마지막 답에만
-  if (state.conversation && view.node === $('thread').lastElementChild) {
+  const made = state.kind === 'brief' && view.index === 1;      // 브리핑 글 자체는 다시 생성하지 않는다(브리핑 화면의 지금 받기로 새로 만든다)
+  if (state.conversation && view.node === $('thread').lastElementChild && !made) {
     const again = iconButton('refresh', '다시 생성', () => regenerate(view));
     again.classList.add('regenerate');
     view.actions.append(again);
@@ -514,8 +521,11 @@ function addActions(view) {
 // ── 작업 단계(모델이 어떤 도구를 어떻게 썼는지) ─────────────────────────
 function brief(value) {
   if (Array.isArray(value)) return `${value.length}건`;
-  if (value && typeof value === 'object') return '{…}';
-  const text = String(value);
+  if (value && typeof value === 'object') {              // 검색 조건처럼 한 겹 안에 든 값은 풀어서 보여 준다
+    const inner = Object.entries(value).filter(([, item]) => ['string', 'number', 'boolean'].includes(typeof item) && item !== '').map(([key, item]) => `${ARGS[key] || key} ${item}`).join(', ');
+    return inner ? (inner.length > 160 ? inner.slice(0, 160) + '…' : inner) : '{…}';
+  }
+  const text = TOOLS[value] || String(value);          // 도구 이름이 값으로 오면(전체 확인의 검색 도구) 한글 이름으로
   return text.length > 120 ? text.slice(0, 120) + '…' : text;
 }
 
@@ -525,6 +535,7 @@ function resultText(summary, isError) {
   if (summary.saved) return `${summary.applied}곳 고침` + (summary.failed ? ` · ${summary.failed}곳 실패` : '');
   if (summary.created) return '파일 만듦';
   if (summary.inspected) return summary.pages ? `${summary.pages}쪽 확인` : '확인';
+  if (typeof summary.checked === 'number') return `${summary.checked.toLocaleString()}건 확인 · ${(summary.matched || 0).toLocaleString()}건 해당`;
   const found = (summary.items || []).length + (summary.more || 0);
   if (typeof summary.total === 'number') return `${summary.total.toLocaleString()}건` + (found && found < summary.total ? ` 중 ${found}건` : '');
   if (summary.groups) return `${summary.groups}개 묶음`;
@@ -582,16 +593,20 @@ function finishSteps(view, stopped) {
 }
 
 async function openConversation(id) {
-  if (state.busy) return;
+  if (state.busy) { if (id === state.conversation) setView(null); return; }
   const response = await api('/api/conversations/' + encodeURIComponent(id));
   if (!response.ok) return loadList();
   const item = await response.json();
   state.conversation = item.id;
+  state.kind = item.kind || '';
+  state.view = null;
+  document.body.classList.remove('paged');
   state.sources = new Map((item.sources || []).map((source) => [source.n, source]));
   setTitle(item.title);
   clearThread();
   let last = null;
   item.messages.forEach((message, index) => {
+    if (item.kind === 'brief' && index === 0) return;          // 브리핑의 머리 글은 사용자가 쓴 것이 아니다
     last = message.role === 'user' ? addUser(message.content, message.files) : addAssistant(message, index);
   });
   if (last && last.node) addActions(last);
@@ -603,6 +618,9 @@ async function openConversation(id) {
 function newConversation() {
   if (state.busy) return;
   state.conversation = null;
+  state.kind = '';
+  state.view = null;
+  document.body.classList.remove('paged');
   state.sources = new Map();
   setTitle('');
   clearThread();
@@ -703,6 +721,9 @@ async function run(payload) {
           const stick = nearBottom();
           addFile(view, event.file);
           if (stick) scrollDown(true);
+        } else if (event.type === 'tool_progress') {
+          const running = view.stepList && view.stepList.lastElementChild && view.stepList.lastElementChild.querySelector('.step.running .step-result');
+          if (running) running.textContent = `${event.checked.toLocaleString()} / ${event.total.toLocaleString()}건`;
         } else if (event.type === 'tool_result') {
           finishStep(view, event);
         } else if (event.type === 'answer') {
@@ -1009,7 +1030,6 @@ $('newtop').addEventListener('click', newConversation);
 $('collapse').addEventListener('click', () => setSidebar(false));
 $('expand').addEventListener('click', () => setSidebar(true));
 $('backdrop').addEventListener('click', closeSidebarOnMobile);
-$('filter').addEventListener('input', renderList);
 $('tobottom').addEventListener('click', () => scrollDown(true));
 $('scroll').addEventListener('scroll', () => { $('tobottom').hidden = nearBottom(); });
 for (const button of $('suggestions').querySelectorAll('button')) {
@@ -1019,7 +1039,8 @@ for (const button of $('suggestions').querySelectorAll('button')) {
   }
 }
 bindMenu($('user'), $('usermenu'));
-bindMenu($('status'), $('statusmenu'));
+$('status').addEventListener('click', () => setView(state.view === 'tools' ? null : 'tools'));
+for (const button of document.querySelectorAll('.side-nav [data-view]')) button.addEventListener('click', () => setView(state.view === button.dataset.view ? null : button.dataset.view));
 bindCitations();
 bindViewer();
 document.addEventListener('click', () => {
@@ -1028,7 +1049,12 @@ document.addEventListener('click', () => {
 });
 $('theme').addEventListener('click', () => applyTheme({system: 'light', light: 'dark', dark: 'system'}[$('theme').dataset.theme]));
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') { closeSidebarOnMobile(); hideCard(true); for (const menu of document.querySelectorAll('.menu')) menu.hidden = true; }
+  if (event.key === 'Escape') {
+    closeSidebarOnMobile(); hideCard(true);
+    for (const menu of document.querySelectorAll('.menu')) menu.hidden = true;
+    if (state.view && !$('viewer').open && !document.querySelector('.topic-form')) setView(null);
+  }
+  if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'k') { event.preventDefault(); setView('search'); }
   if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'o') { event.preventDefault(); newConversation(); }
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName) || document.activeElement.isContentEditable;
   if (event.key === '/' && !typing && !$('viewer').open && !event.ctrlKey && !event.metaKey) { event.preventDefault(); $('input').focus(); }
@@ -1041,17 +1067,288 @@ async function loadStatus() {
   state.limit = me.max_question_chars;
   $('who').textContent = me.name;
   $('initial').textContent = me.name.slice(0, 1).toUpperCase();
-  $('model').textContent = me.model;
   const down = me.servers.filter((server) => !server.ok).length;
-  $('servers').replaceChildren(...me.servers.map((server) => el('li', {class: server.ok ? 'ok' : 'down'}, el('span', {class: 'dot'}),
-                                                                 el('span', {text: server.name}), el('span', {class: 'state', text: server.ok ? '연결됨' : '연결 안 됨'}))));
   $('status').className = 'chip ' + (!me.servers.length ? 'wait' : down ? 'warn' : 'ok');
   $('statuslabel').textContent = !me.servers.length ? `${me.model} · 확인 중` : `${me.model} · 자료 ${me.servers.length - down}/${me.servers.length}`;
   return me.servers.length;
 }
 
+// ── 메뉴에서 여는 화면 ──────────────────────────────────────────────────
+// 대화 자리에 겹쳐 보인다. 같은 메뉴를 다시 누르거나 Esc 를 누르면 보던 대화로 돌아간다(답을 받는 중이어도 끊기지 않는다).
+const VIEWS = {search: {title: '검색', open: openSearch}, brief: {title: '브리핑', open: openBrief}, docs: {title: '문서', open: openDocs},
+               tools: {title: '도구 상태', open: openTools}};
+
+function setView(name) {
+  state.view = name || null;
+  document.body.classList.toggle('paged', Boolean(name));
+  $('page').replaceChildren();
+  setTitle();
+  renderList();
+  closeSidebarOnMobile();
+  if (name) VIEWS[name].open($('page')); else if (!state.busy) $('input').focus();
+}
+
+function when(seconds) {                                   // 오늘이면 시각, 올해면 날짜, 그 전이면 연도까지
+  const moment = new Date(seconds * 1000), now = new Date();
+  if (moment.toDateString() === now.toDateString()) return `${String(moment.getHours()).padStart(2, '0')}:${String(moment.getMinutes()).padStart(2, '0')}`;
+  const day = `${moment.getMonth() + 1}월 ${moment.getDate()}일`;
+  return moment.getFullYear() === now.getFullYear() ? day : `${moment.getFullYear()}년 ${day}`;
+}
+
+function marked(parent, text, words) {                     // 찾은 낱말에 형광펜
+  const low = text.toLowerCase();
+  let at = 0;
+  while (at < text.length) {
+    let next = -1, size = 0;
+    for (const word of words) {
+      const found = low.indexOf(word, at);
+      if (found >= 0 && (next < 0 || found < next)) { next = found; size = word.length; }
+    }
+    if (next < 0) break;
+    if (next > at) parent.append(text.slice(at, next));
+    parent.append(el('mark', {text: text.slice(next, next + size)}));
+    at = next + size;
+  }
+  if (at < text.length) parent.append(text.slice(at));
+  return parent;
+}
+
+function openSearch(page) {
+  const input = el('input', {type: 'search', placeholder: '대화 검색', 'aria-label': '대화 검색', autocomplete: 'off', maxlength: '200'});
+  const box = el('div', {class: 'results'});
+  let ticket = 0, timer = 0;
+  const show = async () => {
+    const text = input.value.trim(), words = text.toLowerCase().split(/\s+/).filter(Boolean), mine = ++ticket;
+    let items = state.conversations;                         // 찾는 말이 없으면 모든 대화를 최근 것부터
+    if (text) {
+      const response = await api('/api/search?q=' + encodeURIComponent(text));
+      if (mine !== ticket || !response.ok) return;
+      items = (await response.json()).results;
+    }
+    box.replaceChildren(...items.map((item) => {
+      const row = el('button', {type: 'button', class: 'result' + (item.kind === 'brief' ? ' brief' : '')},
+                     el('div', {class: 'result-top'}, marked(el('strong'), item.title || '대화', words), el('span', {class: 'result-side', text: when(item.updated)})));
+      if (item.snippet) row.append(marked(el('p'), item.snippet, words));
+      row.addEventListener('click', () => openConversation(item.id));
+      return row;
+    }));
+    if (!items.length) box.append(el('p', {class: 'none', text: text ? '찾는 대화가 없습니다.' : '아직 대화가 없습니다.'}));
+  };
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(show, 140); });
+  input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && box.firstElementChild && box.firstElementChild.click) box.firstElementChild.click(); });
+  page.append(el('div', {class: 'sheet'}, el('label', {class: 'page-search'}, icon('search'), input), box));
+  show();
+  input.focus();
+}
+
+// ── 브리핑: 대화에서 뽑힌 주제를 아침마다 찾아 정리해 준다. 여기서 주제를 고치고, 끄고 켜고, 지난 브리핑을 연다 ──
+const BRIEF_KIND = {'공고': '지원사업 공고', '과제': '연구개발 과제', '둘 다': '공고와 과제'};
+let briefTimer = 0;
+
+function briefSeen(day) {
+  try { if (day) localStorage.setItem('briefSeen', day); return localStorage.getItem('briefSeen') || ''; } catch { return day || ''; }
+}
+
+async function watchBrief(repaint) {                        // 만드는 중이면 5초마다, 아니면 5분마다 상태를 본다
+  clearTimeout(briefTimer);
+  const before = state.brief, info = await (await api('/api/brief')).json();
+  state.brief = info;
+  $('nav-brief').hidden = !info.available;
+  const fresh = info.last && info.last.status === 'done' && info.last.day !== briefSeen(state.view === 'brief' ? info.last.day : '');
+  $('briefmark').hidden = !(info.running || fresh);
+  $('briefmark').classList.toggle('busy', info.running);
+  const finished = before && before.running && !info.running;
+  if (finished) await loadList();
+  if (state.view === 'brief' && (repaint || finished) && !document.querySelector('.topic-form')) paintBrief(info);
+  briefTimer = setTimeout(() => watchBrief(false).catch(() => {}), info.running ? 5000 : 300000);
+}
+
+async function openBrief(page) {
+  page.append(el('div', {class: 'sheet'}, el('p', {class: 'waiting'}, el('span', {class: 'spinner'}))));
+  await watchBrief(true);
+}
+
+async function saveBrief(change) {
+  const response = await api('/api/brief', {method: 'PUT', headers: API_HEADERS, body: JSON.stringify(change)});
+  if (response.ok) Object.assign(state.brief, await response.json());
+  if (state.view === 'brief') paintBrief(state.brief);
+}
+
+function topicForm(info, index) {                           // index 가 없으면 새 주제
+  const item = index === undefined ? {topic: '', kind: '공고', conditions: ''} : info.interests[index];
+  const topic = el('input', {class: 'wide', maxlength: '120', placeholder: '주제', 'aria-label': '주제'});
+  const kind = el('select', {'aria-label': '찾을 것'}, ...Object.entries(BRIEF_KIND).map(([value, text]) => el('option', {value, text})));
+  const conditions = el('input', {maxlength: '160', placeholder: '조건 (지역 · 기업 규모 · 대상)', 'aria-label': '조건'});
+  topic.value = item.topic; kind.value = item.kind; conditions.value = item.conditions;
+  const cancel = el('button', {type: 'button', class: 'pill', text: '취소'}), save = el('button', {type: 'submit', class: 'pill solid', text: '저장'});
+  const form = el('form', {class: 'topic-form'}, topic, kind, conditions, el('div', {class: 'form-actions'}, cancel, save));
+  cancel.addEventListener('click', () => paintBrief(info));
+  form.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.stopPropagation(); paintBrief(info); } });
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!topic.value.trim()) return topic.focus();
+    const entry = {topic: topic.value, kind: kind.value, conditions: conditions.value, pinned: true};     // 손으로 고친 주제는 대화가 바뀌어도 그대로 남는다
+    const interests = info.interests.slice();
+    if (index === undefined) interests.push(entry); else interests[index] = entry;
+    saveBrief({interests});
+  });
+  setTimeout(() => topic.focus());
+  return form;
+}
+
+function paintBrief(info) {
+  const sheet = el('div', {class: 'sheet'});
+  const toggle = el('button', {type: 'button', class: 'switch', role: 'switch', 'aria-checked': String(!info.paused), 'aria-label': '아침마다 받기'});
+  toggle.addEventListener('click', () => saveBrief({paused: !info.paused}));
+  const now = el('button', {type: 'button', class: 'pill keep'}, info.running ? el('span', {class: 'spinner'}) : null, el('span', {text: info.running ? '만드는 중' : '지금 받기'}));
+  now.disabled = info.running;
+  now.addEventListener('click', async () => {
+    now.disabled = true;
+    const response = await api('/api/brief', {method: 'POST', headers: {'X-Requested-With': 'rnd-chat'}});
+    if (response.ok || response.status === 409) watchBrief(true).catch(() => {});
+  });
+  sheet.append(el('div', {class: 'brief-head' + (info.paused ? ' off' : '')}, toggle,
+                  el('div', {class: 'brief-when'}, el('strong', {text: info.paused ? '꺼 둠' : `매일 ${info.time}`}), info.to ? el('span', {text: `메일 ${info.to}`}) : null),
+                  el('span', {class: 'spacer'}), now));
+
+  sheet.append(el('h2', null, '주제', el('span', {text: `${info.interests.length} / ${info.max_interests}`})));
+  info.interests.forEach((item, index) => {
+    const detail = [BRIEF_KIND[item.kind] || item.kind, item.conditions].filter(Boolean).join(' · ');
+    const row = el('div', {class: 'topic'}, el('div', {class: 'topic-main'}, el('strong', {text: item.topic}), el('span', {text: detail})),
+                   item.pinned ? null : el('span', {class: 'from', text: '대화에서'}));
+    row.append(el('span', {class: 'row-actions'}, iconButton('edit', '주제 고치기', () => row.replaceWith(topicForm(info, index))),
+                  iconButton('x', '주제 빼기', () => saveBrief({interests: info.interests.filter((other) => other !== item)}))));
+    sheet.append(row);
+  });
+  if (!info.interests.length) sheet.append(el('p', {class: 'none', text: '대화에서 자주 묻는 주제가 여기에 모입니다.'}));
+  if (info.interests.length < info.max_interests) {
+    const add = el('button', {type: 'button', class: 'add-topic'}, icon('plus'), el('span', {text: '주제 추가'}));
+    add.addEventListener('click', () => add.replaceWith(topicForm(info)));
+    sheet.append(add);
+  }
+
+  if (info.history.length) sheet.append(el('h2', null, '지난 브리핑'));
+  for (const record of info.history) {
+    const note = {done: record.mailed ? '메일 보냄' : '', running: '만드는 중', skipped: '건너뜀', error: '만들지 못함'}[record.status] || '';
+    const side = el('span', {class: 'result-side'}, record.status === 'running' && info.running ? el('span', {class: 'spinner'}) : null, el('span', {text: note}));
+    const row = el(record.conversation_id ? 'button' : 'div', {class: 'result' + (record.conversation_id ? '' : ' quiet'), ...(record.conversation_id ? {type: 'button'} : {})},
+                   el('div', {class: 'result-top'}, el('strong', {text: record.title}), side));
+    if (record.status !== 'done' && record.status !== 'running' && record.note) row.append(el('p', {text: record.note}));
+    if (record.conversation_id) row.addEventListener('click', () => openConversation(record.conversation_id));
+    sheet.append(row);
+  }
+  $('page').replaceChildren(sheet);
+}
+
+// ── 도구 상태: 모델, 자료 서버와 거기서 쓸 수 있는 도구, 아침 자료 갱신 ──
+// ── 문서: 올린 문서와 모델이 만들거나 고친 문서를 대화와 상관없이 모아 본다 ──
+const ORIGIN = {upload: '올린 문서', generated: '만든 문서', edited: '고친 문서'};
+
+async function openDocs(page) {
+  const sheet = el('div', {class: 'sheet'}, el('p', {class: 'waiting'}, el('span', {class: 'spinner'})));
+  page.append(sheet);
+  let info;
+  try {
+    info = await (await api('/api/files')).json();
+  } catch { info = null; }
+  if (state.view !== 'docs') return;
+  if (!info || !info.files) return sheet.replaceChildren(el('p', {class: 'none', text: '문서 목록을 받지 못했습니다.'}));
+  const input = el('input', {type: 'search', placeholder: '문서 검색', 'aria-label': '문서 검색', autocomplete: 'off', maxlength: '200'});
+  const box = el('div', {class: 'results'}), count = el('span', {class: 'count'});
+  let only = '';
+  const tabs = [['', '전체'], ['upload', '올린 문서'], ['made', '만든 문서']].map(([key, label]) => {
+    const tab = el('button', {type: 'button', class: 'pill keep', 'aria-pressed': String(key === only)}, el('span', {text: label}));
+    tab.addEventListener('click', () => { only = key; for (const other of tabs) other.setAttribute('aria-pressed', String(other === tab)); show(); });
+    return tab;
+  });
+  const row = (file, words) => {
+    const detail = [ORIGIN[file.origin] || '', KIND[file.kind] || file.kind, file.pages ? `${file.pages}쪽` : '', size(file.size)].filter(Boolean).join(' · ');
+    const open = el('button', {type: 'button', class: 'doc-open', title: '미리보기'},
+                    el('span', {class: 'doc-kind ' + file.kind, text: file.kind.toUpperCase()}),
+                    el('span', {class: 'doc-main'}, marked(el('strong'), file.name, words), el('span', {text: detail})));
+    open.addEventListener('click', () => openViewer(file));
+    const actions = el('span', {class: 'row-actions'});
+    if (file.conversation) {
+      actions.append(iconButton('out', '대화로 가기', async () => {
+        await openConversation(file.conversation.id);
+        const made = [...document.querySelectorAll('#thread .filecard')].find((node) => node.dataset.id === file.id);
+        if (made) made.scrollIntoView({block: 'center'});
+      }));
+    }
+    actions.append(el('a', {class: 'icon', href: fileUrl(file), download: file.name, title: '내려받기', 'aria-label': '내려받기'}, icon('download')),
+                   iconButton('trash', '문서 지우기', async () => {
+                     if (!confirm(`"${file.name}" 문서를 지울까요?`)) return;
+                     const response = await api(fileUrl(file), {method: 'DELETE', headers: API_HEADERS});
+                     if (!response.ok) return;
+                     info.files = info.files.filter((other) => other !== file);
+                     for (const made of document.querySelectorAll('#thread .filecard')) if (made.dataset.id === file.id) made.remove();
+                     show();
+                   }));
+    return el('div', {class: 'doc'}, open, el('span', {class: 'result-side', text: when(file.created)}), actions);
+  };
+  const show = () => {
+    const words = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const kept = info.files.filter((file) => (!only || (only === 'upload') === (file.origin === 'upload')) && words.every((word) => file.name.toLowerCase().includes(word)));
+    box.replaceChildren(...kept.map((file) => row(file, words)));
+    if (!kept.length) box.append(el('p', {class: 'none', text: info.files.length ? '찾는 문서가 없습니다.' : '아직 문서가 없습니다.'}));
+    count.textContent = info.files.length ? `${info.files.length}개 · ${size(info.files.reduce((sum, file) => sum + (file.size || 0), 0))}` : '';
+  };
+  input.addEventListener('input', show);
+  sheet.replaceChildren(el('label', {class: 'page-search'}, icon('search'), input), el('div', {class: 'doc-bar'}, ...tabs, count), box);
+  show();
+  if (!mobile()) input.focus();
+}
+
+function stamp(text) {                                     // "2026-11-21T09:00:02" → "11월 21일 09:00"
+  const found = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(text || '');
+  return found ? `${Number(found[2])}월 ${Number(found[3])}일 ${found[4]}:${found[5]}` : '';
+}
+
+function took(from, to) {
+  const seconds = Math.round((new Date(to) - new Date(from)) / 1000);
+  if (!(seconds >= 0)) return '';
+  return seconds >= 60 ? `${Math.floor(seconds / 60)}분 ${seconds % 60}초` : `${seconds}초`;
+}
+
+function toolGroup(name, tools, ok, note) {
+  const head = el('summary', {class: 'line ' + (ok ? 'ok' : 'down')}, el('span', {class: 'dot'}), el('span', {class: 'name', text: name}),
+                  el('span', {class: 'note', text: note}), icon('right'));
+  head.lastElementChild.classList.add('caret');
+  if (!tools.length) return el('div', {class: 'line ' + (ok ? 'ok' : 'down')}, el('span', {class: 'dot'}), el('span', {class: 'name', text: name}), el('span', {class: 'note', text: note}));
+  return el('details', {class: 'server'}, head, el('div', {class: 'toolchips'}, ...tools.map((tool) => el('span', {text: TOOLS[tool] || tool}))));
+}
+
+async function openTools(page) {
+  const sheet = el('div', {class: 'sheet'}, el('p', {class: 'waiting'}, el('span', {class: 'spinner'})));
+  page.append(sheet);
+  let info;
+  try {
+    info = await (await api('/api/status')).json();
+  } catch { info = null; }
+  if (state.view !== 'tools') return;
+  if (!info) return sheet.replaceChildren(el('p', {class: 'none', text: '상태를 받지 못했습니다.'}));
+  const model = info.model.ok === false ? 'down' : info.model.ok ? 'ok' : '';
+  sheet.replaceChildren(
+    el('h2', null, '모델'),
+    el('div', {class: 'line ' + model}, el('span', {class: 'dot'}), el('span', {class: 'name', text: info.model.name}),
+       el('span', {class: 'note', text: info.model.ok === false ? '마지막 요청 실패' : ''})),
+    el('h2', null, '자료 서버'),
+    ...info.servers.map((server) => toolGroup(SERVERS[server.name] || server.name, server.tools, server.ok, server.ok ? `도구 ${server.tools.length}` : '연결 안 됨')),
+    info.local.length ? toolGroup('문서 작업 · 전체 확인', info.local, true, `도구 ${info.local.length}`) : null);
+  if (info.refresh) {
+    const done = info.refresh.finished ? took(info.refresh.started, info.refresh.finished) : '진행 중';
+    sheet.append(el('h2', null, '자료 갱신', el('span', {text: [stamp(info.refresh.started), done].filter(Boolean).join(' · ')})));
+    for (const step of info.refresh.steps) {
+      sheet.append(el('div', {class: 'line ' + (step.ok ? 'ok' : 'down')}, el('span', {class: 'dot'}), el('span', {class: 'name', text: step.name}),
+                      el('span', {class: 'note', text: step.note || (step.ok ? '' : '실패')})));
+    }
+  }
+  loadStatus().catch(() => {});                              // 방금 다시 확인한 연결 상태를 위쪽 표시에도 반영한다
+}
+
 (async () => {
   try {
+    watchBrief(false).catch(() => {});
     if (!await loadStatus()) setTimeout(() => loadStatus().catch(() => {}), 2500);     // 서버가 막 떴으면 자료 서버 확인이 조금 늦다
     await loadList();
     updateSend();

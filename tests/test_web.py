@@ -371,7 +371,7 @@ class WebTests(unittest.TestCase):
         response = upload(tiny_pdf('Company name:'), name='../../신청 양식.pdf')
         meta = response.json()
         self.assertEqual((response.status_code, meta['name'], meta['kind'], meta['pages'], meta['shown'], meta['origin']), (200, '신청 양식.pdf', 'pdf', 1, 1, 'upload'))
-        self.assertEqual(sorted(path.name for path in Path(self.data).rglob('*') if path.is_file()), sorted([meta['id'], meta['id'] + '.json']))   # 디스크에는 무작위 이름으로만
+        self.assertEqual(sorted(path.name for path in (Path(self.data) / 'files').rglob('*') if path.is_file()), sorted([meta['id'], meta['id'] + '.json']))   # 디스크에는 무작위 이름으로만
         response = kim.post('/api/chat', json={'message': '이 양식대로 문서를 만들어줘', 'attachments': [meta['id']]}, headers=API)
         events = [json.loads(line[6:]) for line in response.text.split('\n') if line.startswith('data: ')]
         sent = self.calls[-1][-1]['content']
@@ -479,6 +479,284 @@ class WebTests(unittest.TestCase):
         inspected = asyncio.run(self.local.call('inspect_document', {'file_id': again['id'], 'table': 0, 'pages': [1, 7]}))
         self.assertTrue('c1 "김가온"' in inspected.text and len(inspected.images) == 1, inspected.text)
 
+    def test_conversations_and_files_survive_a_restart(self):
+        kim = self.client('kim')
+        self.found = {'total': 1, 'items': [{'title': '가 과제', 'url': 'https://www.ntis.go.kr/p?id=1'}]}
+        self.answer = '가 과제가 있습니다[1].'
+        _, events = self.ask(kim, '양자 과제')
+        first = events[-1]['conversation_id']
+        self.ask(kim, '더 찾아줘', first)
+        self.answer = None
+        _, events = self.ask(kim, '지울 대화')
+        second = events[-1]['conversation_id']
+        kim.patch('/api/conversations/' + first, json={'title': '양자 과제 정리'}, headers=API)
+        self.assertEqual(kim.delete('/api/conversations/' + second, headers=API).status_code, 200)
+        uploaded = kim.post('/api/files', files={'file': ('양식.pdf', tiny_pdf(), 'application/pdf')}, headers=API).json()
+        self.ask(self.client('lee', 'plain-password'), '이 씨의 대화')
+        before = kim.get('/api/conversations/' + first).json()
+        database = Path(self.data) / 'chat.sqlite3'
+        self.assertEqual(database.stat().st_mode & 0o777, 0o600)                     # 대화 파일은 서버 계정만 읽는다
+
+        # 서버를 다시 띄운 것처럼 앱을 새로 만든다(세션은 메모리에 있어 다시 로그인한다)
+        self.app = web.create_app(self.settings, self.users, runner=lambda *args: None, throttle=self.throttle)
+        kim = self.client('kim')
+        self.assertEqual([(item['id'], item['title']) for item in kim.get('/api/conversations').json()['conversations']], [(first, '양자 과제 정리')])
+        after = kim.get('/api/conversations/' + first).json()
+        self.assertEqual(after, before)                                              # 메시지·출처·작업 기록까지 그대로
+        self.assertEqual((len(after['messages']), after['sources'][0]['title'], after['messages'][1]['steps'][0]['name']), (4, '가 과제', 'count_projects'))
+        self.assertEqual(kim.get('/api/conversations/' + second).status_code, 404)   # 지운 대화는 돌아오지 않는다
+        self.assertEqual(kim.get(f'/api/files/{uploaded["id"]}').status_code, 200)   # 올린 파일도 남아 있다
+        lee = self.client('lee', 'plain-password')
+        self.assertEqual(len(lee.get('/api/conversations').json()['conversations']), 1)
+        self.assertEqual(lee.get('/api/conversations/' + first).status_code, 404)    # 남의 대화는 여전히 볼 수 없다
+
+    def briefing_app(self, runner, **options):
+        """브리핑을 켠 설정으로 앱을 다시 만든다(대화는 파일에서 이어받는다). 관심사 뽑기와 메일 보내기는 가짜로 바꾼다."""
+        import dataclasses
+        from chat.settings import Briefing, Mail
+        settings = dataclasses.replace(self.settings, briefing=Briefing(enabled=True, app_url='https://rnd.test', **options),
+                                       mail=Mail(username='bot@gmail.com', password='app-password', sender_name='R&D 검색'),
+                                       users=({'name': 'kim', 'email': 'kim@example.org'}, {'name': 'lee', 'brief': True}))
+        self.sent, self.topics, self.questions = [], [{'topic': '드론의 농업 활용', 'kind': '둘 다', 'conditions': '경기도'}], []
+
+        async def interests(llm, questions, previous, limit, muted=()):
+            self.questions, self.muted = questions, list(muted)
+            return self.topics
+        for module, name, fake in ((web.brief, 'interests', interests),
+                                   (web.mailer, 'send', lambda mail, to, subject, page, plain: self.sent.append((to, subject, page, plain)))):
+            self.addCleanup(setattr, module, name, getattr(module, name))
+            setattr(module, name, fake)
+        self.app = web.create_app(settings, self.users, runner=runner, throttle=self.throttle)
+        return self.app
+
+    def test_morning_brief_is_built_from_the_chat_history_and_mailed_once_a_day(self):
+        from datetime import datetime
+        self.ask(self.client('kim'), '경기도에서 드론을 농업에 쓰는 지원사업 찾아줘')
+        asked = []
+
+        async def runner(messages, listener, local=None):
+            asked.append(messages[0]['content'])
+            _, summary = local.observe('search_notices', {}, json.dumps({'total': 1, 'results': [
+                {'title': '농업용 드론 실증 <b>지원</b>', 'notice_id': 'PBLN_000000000000042'}]}, ensure_ascii=False), False)
+            await listener({'type': 'tool_call', 'name': 'search_notices', 'arguments': {'query': '드론'}})
+            await listener({'type': 'tool_result', 'name': 'search_notices', 'is_error': False, 'chars': 9, 'images': 0, 'summary': summary})
+            return agent.Outcome('**드론의 농업 활용**\n\n새 공고 1건입니다.\n\n| 공고 | 마감 |\n|---|---|\n| 농업용 드론 실증 지원[1] | 11-30 |', messages, 2)
+        app = self.briefing_app(runner)
+        tick = lambda moment: asyncio.run(app.state.brief_tick(datetime.fromisoformat(moment)))
+        kim, lee = self.client('kim'), self.client('lee', 'plain-password')
+        self.assertEqual(tick('2026-11-21T09:59'), [])                        # 시각 전에는 만들지 않는다
+        self.assertEqual(tick('2026-11-21T10:00'), ['kim', 'lee'])
+        # 대화 기록이 없는 계정은 만들지 않는다
+        self.assertEqual((lee.get('/api/brief').json()['last']['status'], lee.get('/api/conversations').json()['conversations']), ('skipped', []))
+        # 대화 기록이 있는 계정: 그 질문에서 관심사를 뽑아 브리핑을 만들고, 대화 하나로 남긴다
+        self.assertEqual([item['question'] for item in self.questions], ['경기도에서 드론을 농업에 쓰는 지원사업 찾아줘'])
+        listing = kim.get('/api/conversations').json()['conversations']
+        self.assertEqual([(item['title'], item.get('kind')) for item in listing], [('11월 21일 브리핑', 'brief'), ('경기도에서 드론을 농업에 쓰는 지원사업 찾아줘', None)])
+        made = kim.get('/api/conversations/' + listing[0]['id']).json()
+        self.assertEqual((made['kind'], made['messages'][0]['content'], made['sources'][0]['title']), ('brief', '11월 21일 브리핑', '농업용 드론 실증 <b>지원</b>'))
+        self.assertIn('농업용 드론 실증 지원[1]', made['messages'][1]['content'])
+        self.assertEqual(made['messages'][1]['steps'][0]['name'], 'search_notices')
+        for expected in ('드론의 농업 활용', '조건: 경기도', '첫 브리핑입니다', '2025년·2026년'):          # 모델에 준 지시: 관심사와 범위
+            self.assertIn(expected, asked[-1])
+        # 메일: 받는 주소가 있는 계정에만 간다. 자료에서 온 글은 태그로 살아나지 않는다
+        self.assertEqual([(to, subject) for to, subject, _, _ in self.sent], [('kim@example.org', '11월 21일 브리핑')])
+        page = self.sent[0][2]
+        self.assertIn('href="https://www.bizinfo.go.kr/sii/siia/selectSIIA200Detail.do?pblancId=PBLN_000000000000042"', page)
+        self.assertIn('농업용 드론 실증 &lt;b&gt;지원&lt;/b&gt;', page)
+        self.assertNotIn('<b>지원', page)
+        self.assertIn('href="https://rnd.test"', page)
+        status = kim.get('/api/brief').json()
+        self.assertEqual((status['available'], status['mail'], status['last']['status'], status['last']['mailed'], status['interests']),
+                         (True, True, 'done', True, self.topics))
+        self.assertEqual((tick('2026-11-21T10:30'), len(self.sent)), ([], 1))             # 하루에 한 번만
+        again = kim.post('/api/chat', json={'conversation_id': listing[0]['id'], 'regenerate': True}, headers=API)
+        self.assertEqual(again.status_code, 400)                              # 브리핑 글은 '다시 생성'으로 바꾸지 않는다
+        # 다음 날: 지난 브리핑 이후의 변화를 묻고, 브리핑 대화의 머리 글은 관심사를 뽑는 질문에 넣지 않는다
+        self.assertEqual(tick('2026-11-22T10:01'), ['kim', 'lee'])
+        self.assertIn('지난 브리핑(2026-11-21) 이후', asked[-1])
+        self.assertEqual([item['question'] for item in self.questions], ['경기도에서 드론을 농업에 쓰는 지원사업 찾아줘'])
+        self.assertEqual(tick('2026-11-23T18:30'), [])                        # 서버가 늦게 뜬 날은 만들지 않는다
+        # 지금 받기는 받도록 설정된 계정이 화면에서 누를 때만
+        self.assertEqual(kim.post('/api/brief').status_code, 403)             # API 헤더 없이는 안 된다
+        self.assertEqual(self.client().get('/api/brief').status_code, 401)
+
+    def test_a_failed_brief_is_recorded_and_a_mail_failure_does_not_lose_it(self):
+        from datetime import datetime
+        self.ask(self.client('kim'), '양자컴퓨팅 과제 찾아줘')
+
+        async def runner(messages, listener, local=None):
+            if self.error:
+                raise self.error
+            return agent.Outcome('브리핑 글', messages, 1)
+        app = self.briefing_app(runner)
+        kim = self.client('kim')
+        self.error = LlmError('모델 서버가 답하지 않았습니다')
+        asyncio.run(app.state.brief_tick(datetime.fromisoformat('2026-11-21T10:00')))
+        last = kim.get('/api/brief').json()['last']
+        self.assertEqual((last['status'], '모델 서버가 답하지 않았습니다' in last['note'], self.sent), ('error', True, []))
+        self.assertNotIn('kim', asyncio.run(app.state.brief_tick(datetime.fromisoformat('2026-11-21T10:01'))))     # 곧바로 되풀이하지 않는다(20분 뒤 다시)
+        self.error = None
+
+        def refuse(mail, to, subject, page, plain):
+            raise OSError('연결 실패')
+        web.mailer.send = refuse
+        asyncio.run(app.state.make_brief('kim', '2026-11-21'))
+        last = kim.get('/api/brief').json()['last']
+        self.assertEqual((last['status'], last['mailed'], '메일을 보내지 못했습니다' in last['note']), ('done', False, True))
+        self.assertEqual(kim.get('/api/conversations').json()['conversations'][0]['kind'], 'brief')     # 메일이 안 가도 화면에는 남는다
+
+    def test_brief_topics_can_be_edited_and_the_morning_run_paused(self):
+        from datetime import datetime
+        self.ask(self.client('kim'), '경기도에서 드론을 농업에 쓰는 지원사업 찾아줘')
+        asked = []
+
+        async def runner(messages, listener, local=None):
+            asked.append(messages[0]['content'])
+            return agent.Outcome('브리핑 글', messages, 1)
+        app = self.briefing_app(runner)
+        tick = lambda moment: asyncio.run(app.state.brief_tick(datetime.fromisoformat(moment)))
+        kim, lee = self.client('kim'), self.client('lee', 'plain-password')
+        put = lambda client, body, headers=API: client.put('/api/brief', json=body, headers=headers)
+        self.assertEqual(tick('2026-11-21T10:00'), ['kim', 'lee'])
+        status = kim.get('/api/brief').json()
+        self.assertEqual((status['interests'], status['paused'], status['max_interests'], status['to']), (self.topics, False, 5, 'ki***@example.org'))
+        self.assertEqual([(item['title'], item['status'], item['mailed'], bool(item['conversation_id'])) for item in status['history']],
+                         [('11월 21일 브리핑', 'done', True, True)])
+        # 대화에서 뽑힌 주제를 빼고 직접 하나를 넣는다: 뺀 주제는 다시 뽑히지 않고, 넣은 주제는 대화가 없어도 남는다
+        own = {'topic': ' 양자컴퓨팅  과제 ', 'kind': '과제', 'conditions': '', 'pinned': True}
+        saved = put(kim, {'interests': [own]}).json()
+        self.assertEqual(saved['interests'], [{'topic': '양자컴퓨팅 과제', 'kind': '과제', 'conditions': '', 'pinned': True}])
+        self.assertEqual(tick('2026-11-22T10:00'), ['kim', 'lee'])
+        self.assertEqual(self.muted, ['드론의 농업 활용'])
+        self.assertTrue('양자컴퓨팅 과제' in asked[-1] and '드론의 농업 활용' not in asked[-1])
+        self.assertEqual(kim.get('/api/brief').json()['interests'], saved['interests'])
+        # 뺐던 주제를 다시 넣으면 다시 뽑히지 않게 적어 둔 것도 지워진다
+        put(kim, {'interests': [own, {'topic': '드론의 농업 활용', 'kind': '둘 다', 'conditions': '경기도'}]})
+        tick('2026-11-23T10:00')
+        self.assertEqual((self.muted, '드론의 농업 활용' in asked[-1]), ([], True))
+        # 아침마다 받기를 끄면 시각이 되어도 만들지 않는다. 지금 받기는 된다
+        self.assertEqual(put(kim, {'paused': True}).json()['paused'], True)
+        self.assertEqual((tick('2026-11-24T10:00'), kim.get('/api/brief').json()['paused']), (['lee'], True))
+        self.assertEqual(kim.post('/api/brief', headers=API).status_code, 202)
+        # 지운 브리핑은 기록에는 남되 열 수는 없다
+        history = kim.get('/api/brief').json()['history']
+        kim.delete('/api/conversations/' + history[-1]['conversation_id'], headers=API)
+        self.assertEqual(kim.get('/api/brief').json()['history'][-1]['conversation_id'], '')
+        for bad in ({'interests': [own] * 6}, {'interests': '드론'}):
+            self.assertEqual(put(kim, bad).status_code, 400)
+        self.assertEqual((put(kim, {'paused': False}, ORIGIN).status_code, self.client().put('/api/brief', json={}).status_code), (403, 401))
+        plain = web.create_app(self.settings, self.users, runner=runner, throttle=self.throttle)       # 브리핑을 켜지 않은 서버
+        self.app = plain
+        self.assertEqual(put(self.client('kim'), {'paused': True}).status_code, 403)
+
+    def test_conversations_can_be_searched_by_what_was_said(self):
+        kim, lee = self.client('kim'), self.client('lee', 'plain-password')
+        self.answer = '**수소 연료전지** 과제는 | 3건 | 입니다. ' + '가' * 200 + ' 끝에 나오는 낱말 드론'
+        first = self.ask(kim, '수소 과제 알려줘')[1][-1]['conversation_id']
+        self.answer = '공고 두 건입니다.'
+        second = self.ask(kim, '강원도 지원사업')[1][-1]['conversation_id']
+        self.ask(lee, '수소 과제는 내 것')
+        find = lambda client, words: client.get('/api/search', params={'q': words}).json()['results']
+        self.assertEqual([item['id'] for item in find(kim, '수소')], [first])                  # 남의 대화는 찾지 않는다
+        self.assertTrue(find(kim, '연료전지 3건')[0]['snippet'].startswith('수소 연료전지 과제는 3건 입니다.'))      # 답의 글에서도 찾고, 기호는 뺀다
+        tail = find(kim, '드론')[0]['snippet']
+        self.assertTrue(tail.startswith('…') and tail.endswith('드론') and len(tail) < 160)
+        self.assertEqual([item['id'] for item in find(kim, '공고 강원도')], [second])            # 낱말은 모두 있어야 한다
+        self.assertNotIn('snippet', find(kim, '강원도')[0])                              # 제목이 된 질문만 맞으면 덧붙일 글이 없다
+        self.assertEqual((find(kim, '없는말'), find(kim, '  ')), ([], []))
+        self.assertEqual(self.client().get('/api/search?q=x').status_code, 401)
+
+    def test_documents_are_listed_apart_from_conversations_and_can_be_deleted(self):
+        kim = self.client('kim')
+        self.assertEqual(kim.get('/api/files').json(), {'files': [], 'bytes': 0})
+        self.make = ('create_document', {'filename': '신청서', 'title': '참가 신청서', 'blocks': [{'type': 'paragraph', 'text': '내용'}]})
+        _, events = self.ask(kim, '신청서 만들어줘')
+        conversation_id, first = events[-1]['conversation_id'], [event['file'] for event in events if event['type'] == 'file'][0]
+        kim.post('/api/chat', json={'conversation_id': conversation_id, 'regenerate': True}, headers=API)
+        made = kim.get('/api/conversations/' + conversation_id).json()['messages'][1]['files'][0]
+        self.assertNotEqual(made['id'], first['id'])
+        self.assertEqual(kim.get('/api/files/' + first['id']).status_code, 404)       # 다시 생성으로 사라진 답의 파일은 남기지 않는다
+        self.make = None
+        uploaded = kim.post('/api/files', files={'file': ('양식.pdf', tiny_pdf(), 'application/pdf')}, headers=API).json()
+        listing = kim.get('/api/files').json()
+        self.assertEqual([(item['id'], item['name'], item['origin'], item.get('conversation')) for item in listing['files']],
+                         [(uploaded['id'], '양식.pdf', 'upload', None), (made['id'], '신청서.docx', 'generated', {'id': conversation_id, 'title': '신청서 만들어줘'})])
+        self.assertEqual(listing['bytes'], uploaded['size'] + made['size'])
+        self.assertEqual((listing['files'][0]['pages'], 'changes' in listing['files'][1]), (1, False))
+        lee = self.client('lee', 'plain-password')
+        self.assertEqual(lee.get('/api/files').json()['files'], [])                   # 남의 문서는 목록에도 없다
+        self.assertEqual(self.client().get('/api/files').status_code, 401)
+        self.assertEqual(kim.delete('/api/files/' + made['id'], headers=ORIGIN).status_code, 403)
+        self.assertEqual(lee.delete('/api/files/' + made['id'], headers=API).status_code, 404)
+        self.assertEqual(kim.get('/api/files/' + made['id']).status_code, 200)
+        self.assertEqual(kim.delete('/api/files/' + made['id'], headers=API).json(), {'deleted': True})
+        self.assertEqual(kim.get('/api/files/' + made['id']).status_code, 404)
+        self.assertNotIn('files', kim.get('/api/conversations/' + conversation_id).json()['messages'][1])     # 대화에 열리지 않는 카드가 남지 않는다
+        self.assertEqual([item['id'] for item in kim.get('/api/files').json()['files']], [uploaded['id']])
+        self.app = web.create_app(self.settings, self.users, runner=lambda *args: None, throttle=self.throttle)     # 서버를 다시 띄워도 그대로다
+        kim = self.client('kim')
+        self.assertEqual([item['id'] for item in kim.get('/api/files').json()['files']], [uploaded['id']])
+        self.assertNotIn('files', kim.get('/api/conversations/' + conversation_id).json()['messages'][1])
+
+    def test_tool_status_lists_servers_tools_and_the_morning_refresh(self):
+        import dataclasses
+        from types import SimpleNamespace
+        from chat.settings import Briefing
+        report = Path(self.data) / 'refresh.json'
+        report.write_text(json.dumps({'started': '2026-11-21T09:00:02', 'finished': '2026-11-21T09:03:30', 'ok': False, 'steps': [
+            {'name': '진행 중 공고', 'ok': True, 'last': 'INFO: 일일 갱신 결과: 활성 1358건, 신규 26건, 목록 제외 19건'},
+            {'name': '공고 이력', 'ok': False, 'last': 'ERROR: 수집 중단: 같은 출력 디렉토리에서 이미 수집이 실행 중입니다: /home/someone/data/history'},
+            {'name': '뜻 색인', 'ok': True, 'last': '{"notices": 54011, "indexed": 54011}'}]}, ensure_ascii=False), encoding='utf-8')
+        up, down = SimpleNamespace(name='bizinfo'), SimpleNamespace(name='ntis')
+        hub = SimpleNamespace(servers=[up, down], unavailable={'ntis': 'ConnectError: http://10.0.0.1:8768'},
+                              tools={name: SimpleNamespace(name=name, server=up) for name in ('search_notices', 'get_notice')})
+        settings = dataclasses.replace(self.settings, briefing=Briefing(refresh_status=str(report)))
+        self.app = web.create_app(settings, self.users, runner=lambda *a: None, hub=hub, throttle=self.throttle)
+        response = self.client('kim').get('/api/status')
+        status = response.json()
+        self.assertEqual(status['model'], {'name': 'hai', 'ok': None})
+        self.assertEqual(status['servers'], [{'name': 'bizinfo', 'ok': True, 'tools': ['search_notices', 'get_notice']}, {'name': 'ntis', 'ok': False, 'tools': []}])
+        self.assertTrue({'edit_document', 'create_document', 'review_all'} <= set(status['local']))
+        self.assertEqual(status['refresh'], {'started': '2026-11-21T09:00:02', 'finished': '2026-11-21T09:03:30', 'steps': [
+            {'name': '진행 중 공고', 'ok': True, 'note': '1,358건 · 새로 26 · 내림 19'}, {'name': '공고 이력', 'ok': False, 'note': '다른 수집이 돌고 있어 건너뜀'},
+            {'name': '뜻 색인', 'ok': True, 'note': '54,011건'}]})
+        self.assertFalse('/home/' in response.text or '10.0.0.1' in response.text)          # 경로와 내부 주소는 내보내지 않는다
+        self.assertEqual(self.client().get('/api/status').status_code, 401)
+
+    def test_brief_helpers_pick_recent_questions_and_survive_a_bad_model_reply(self):
+        from chat import brief, mailer
+        from chat.settings import Mail
+        now = 1_800_000_000.0
+        items = [{'updated': now - 86400, 'messages': [{'role': 'user', 'content': ' 드론   공고 '}, {'role': 'assistant', 'content': '답'}]},
+                 {'updated': now - 40 * 86400, 'messages': [{'role': 'user', 'content': '오래된 질문'}]},
+                 {'updated': now, 'kind': 'brief', 'messages': [{'role': 'user', 'content': '11월 21일 브리핑'}, {'role': 'assistant', 'content': '글'},
+                                                               {'role': 'user', 'content': '이 중 마감 임박한 것만'}]}]
+        self.assertEqual([item['question'] for item in brief.asked(items, now, 30)], ['이 중 마감 임박한 것만', '드론 공고'])
+
+        class Model:
+            def __init__(self, content):
+                self.content = content
+
+            async def complete(self, messages, tools=None, on_text=None, thinking=None, max_tokens=None):
+                self.prompt = messages
+                if self.content is None:
+                    raise LlmError('실패')
+                return {'content': self.content, 'tool_calls': [], 'finish_reason': 'stop', 'usage': {}}
+        previous = [{'topic': '앞서 뽑은 주제', 'kind': '공고', 'conditions': ''}]
+        good = Model('다음과 같습니다. [{"topic": " 드론의  농업 활용 ", "kind": "이상한 값", "conditions": "경기도"}, {"topic": "드론의 농업 활용"}, {"topic": ""}, 3]')
+        self.assertEqual(asyncio.run(brief.interests(good, [{'day': '11-19', 'question': '드론 공고'}], previous, 5)),
+                         [{'topic': '드론의 농업 활용', 'kind': '공고', 'conditions': '경기도'}])
+        self.assertIn('앞서 뽑아 둔 주제', good.prompt[1]['content'])
+        for broken in (Model('모르겠습니다'), Model('[{"topic": '), Model(None)):                 # 답을 읽지 못하면 앞서 뽑아 둔 것을 쓴다
+            self.assertEqual(asyncio.run(brief.interests(broken, [{'day': '11-19', 'question': 'x'}], previous, 5)), previous)
+        later = brief.instruction(previous, '2026-11-21', '2026-11-20')
+        self.assertTrue('posted_from 에 2026-11-20' in later and '2026-11-28' in later and '첫 브리핑' not in later)
+        letter = mailer.message(Mail(username='bot@gmail.com', password='x', sender_name='R&D 검색'), 'kim@example.org', '11월 21일\n브리핑', '<p>글</p>', '글')
+        self.assertEqual((letter['To'], letter['Subject'], 'bot@gmail.com' in letter['From'], bool(letter['Date'])), ('kim@example.org', '11월 21일 브리핑', True, True))
+        for bad in ('주소 아님', 'a@b', 'kim@example.org, evil@example.org'):
+            with self.assertRaises(ValueError):
+                mailer.send(Mail(username='bot@gmail.com', password='x'), bad, '제목', '<p>글</p>', '글')
+
     def test_answers_carry_sources_and_a_record_of_tool_use(self):
         kim = self.client('kim')
         self.found = {'total': 2, 'items': [{'title': '가 과제', 'organization': '가 대학', 'url': 'https://www.ntis.go.kr/p?id=1'},
@@ -500,6 +778,8 @@ class WebTests(unittest.TestCase):
         self.ask(kim, '더 찾아줘', conversation_id)
         self.assertEqual([item['cite'] for item in json.loads(self.seen)['items']], [2, 3])
         self.assertIn('[2] 나 과제 — https://www.ntis.go.kr/p?id=2', self.local.system_note)
+        # 앞서 무엇을 찾았고 그중 얼마나 봤는지도 알려 준다(앞선 답의 목록에서만 골라 답하지 않게)
+        self.assertIn('search_projects(query_text=양자, edits=2건) → 전체 2건', self.local.system_note)
         self.assertEqual(len(kim.get('/api/conversations/' + conversation_id).json()['sources']), 3)
         # 내보낸 문서: 번호는 처음 나온 순서로 바뀌고 끝에 출처가 붙는다
         exported = Document(io.BytesIO(kim.get(f'/api/conversations/{conversation_id}/export?index=1&format=docx').content))

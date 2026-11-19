@@ -24,14 +24,16 @@ class Client:
         await self._http.aclose()
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                       on_text: Callable[[str], Awaitable[None] | None] | None = None, thinking: bool | None = None) -> dict[str, Any]:
+                       on_text: Callable[[str], Awaitable[None] | None] | None = None, thinking: bool | None = None,
+                       max_tokens: int | None = None) -> dict[str, Any]:
         """답 하나를 받는다. 돌려주는 것: {'content': 글, 'tool_calls': [{'id', 'name', 'arguments'}], 'finish_reason', 'usage'}.
 
         on_text 를 주면 스트리밍으로 받아, 글이 조각조각 올 때마다 on_text(조각)을 부른다. 돌려주는 값은 같다.
         thinking: 답하기 전에 속으로 따져 보게 할지(생각하는 모델에서만 뜻이 있다). None 이면 설정을, 설정도 없으면 모델 기본을 따른다.
+        max_tokens: 이번 답의 길이 상한(속생각 포함). 주지 않으면 설정값.
         """
         body: dict[str, Any] = {'model': self.settings.model, 'messages': messages, 'temperature': self.settings.temperature,
-                                'max_tokens': self.settings.max_tokens}
+                                'max_tokens': min(max_tokens or self.settings.max_tokens, self.settings.max_tokens)}
         if thinking is None and self.settings.thinking:
             thinking = self.settings.thinking == 'on'
         if thinking is not None:                         # vLLM 이 대화 틀(chat template)에 넘겨 주는 값. 모르는 모델은 무시한다
@@ -57,7 +59,7 @@ class Client:
         calls = [{'id': call.get('id') or f'call_{index}', 'name': (call.get('function') or {}).get('name', ''),
                   'arguments': (call.get('function') or {}).get('arguments', '')}
                  for index, call in enumerate(message.get('tool_calls') or [])]
-        return {'content': message.get('content') or '', 'tool_calls': calls, 'finish_reason': choice.get('finish_reason'),
+        return {'content': (message.get('content') or '').strip(), 'tool_calls': calls, 'finish_reason': choice.get('finish_reason'),
                 'usage': data.get('usage') or {}}
 
     async def _stream(self, body: dict[str, Any], on_text: Callable[[str], Awaitable[None] | None]) -> dict[str, Any]:
@@ -99,4 +101,4 @@ class Client:
         ordered = [calls[index] for index in sorted(calls)]
         for index, call in enumerate(ordered):
             call['id'] = call['id'] or f'call_{index}'
-        return {'content': ''.join(content), 'tool_calls': ordered, 'finish_reason': finish, 'usage': usage}
+        return {'content': ''.join(content).strip(), 'tool_calls': ordered, 'finish_reason': finish, 'usage': usage}      # 생각하는 모델은 답 앞에 빈 줄을 둔다

@@ -25,6 +25,7 @@
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 13.2A8.5 8.5 0 1 1 10.8 3.5a6.6 6.6 0 0 0 9.7 9.7z"/></symbol>
   <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></symbol>
+  <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="m3.800 7.500 8.200 6 8.200-6"/></symbol>
   <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9.5 20.5H6a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2h3.5M15.5 16.5 20 12l-4.5-4.5M20 12H9.5"/></symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
   <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
@@ -41,6 +42,8 @@
   <symbol id="i-megaphone" viewBox="0 0 24 24"><path d="M4 10v4a1 1 0 0 0 1 1h2.5l7.500 4V5L7.500 9H5a1 1 0 0 0-1 1zM18 9.500a4 4 0 0 1 0 5M8 15v3.500a1.500 1.500 0 0 0 3 0V16.800"/></symbol>
   <symbol id="i-trend" viewBox="0 0 24 24"><path d="M4 19.500h16M5.500 15.500l4.500-5 3.500 3 5-6.500M14.500 7h4v4"/></symbol>
   <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9.500 3.500h5M10.500 3.500v5.800L5 18.300a1.500 1.500 0 0 0 1.300 2.200h11.400a1.500 1.500 0 0 0 1.300-2.200l-5.500-9V3.500M8 14.500h8"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.500"/><path d="M12 7.500V12l3 2"/></symbol>
+  <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12.500h4l2.500-6.500 4.500 12 2.500-5.500H21"/></symbol>
   <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 7h11M9 12h11M9 17h11M4.500 7h.010M4.500 12h.010M4.500 17h.010"/></symbol>
 </svg>
 
@@ -51,8 +54,13 @@
     <a class="brand" href="/"><svg class="logo" aria-hidden="true"><use href="#i-logo"/></svg><span>R&amp;D 검색</span></a>
     <button id="collapse" class="icon" type="button" aria-label="사이드바 닫기" title="사이드바 닫기"><svg><use href="#i-panel"/></svg></button>
   </div>
-  <button id="new" class="new" type="button" title="새 대화 (Ctrl Shift O)"><svg><use href="#i-plus"/></svg><span>새 대화</span></button>
-  <label class="search"><svg><use href="#i-search"/></svg><input id="filter" type="search" aria-label="대화 찾기" title="대화 찾기" autocomplete="off"></label>
+  <nav class="side-nav" aria-label="메뉴">
+    <button id="new" type="button" title="새 대화 (Ctrl Shift O)"><svg><use href="#i-plus"/></svg><span>새 대화</span></button>
+    <button id="nav-search" type="button" data-view="search" title="대화 검색 (Ctrl K)"><svg><use href="#i-search"/></svg><span>검색</span></button>
+    <button id="nav-brief" type="button" data-view="brief" hidden><svg><use href="#i-clock"/></svg><span>브리핑</span><span id="briefmark" class="mark" hidden></span></button>
+    <button id="nav-docs" type="button" data-view="docs"><svg><use href="#i-file"/></svg><span>문서</span></button>
+    <button id="nav-tools" type="button" data-view="tools"><svg><use href="#i-pulse"/></svg><span>도구</span></button>
+  </nav>
   <nav id="list" aria-label="대화 목록"></nav>
   <div class="side-foot">
     <div id="usermenu" class="menu up" role="menu" hidden>
@@ -71,15 +79,10 @@
     <button id="newtop" class="icon" type="button" aria-label="새 대화" title="새 대화"><svg><use href="#i-plus"/></svg></button>
     <h1 id="title">새 대화</h1>
     <span class="spacer"></span>
-    <div class="anchor">
-      <button id="status" class="chip" type="button" aria-haspopup="true" aria-expanded="false"><span class="dot"></span><span id="statuslabel">연결 확인 중</span></button>
-      <div id="statusmenu" class="menu down" hidden>
-        <p class="menu-title">모델</p><p class="menu-row"><span id="model"></span></p>
-        <p class="menu-title">자료 서버</p><ul id="servers"></ul>
-      </div>
-    </div>
+    <button id="status" class="chip" type="button" title="도구 상태"><span class="dot"></span><span id="statuslabel">연결 확인 중</span></button>
   </header>
 
+  <section id="page"></section>
   <div id="scroll"><div id="thread" aria-live="polite"></div></div>
   <button id="tobottom" class="icon float" type="button" aria-label="맨 아래로" hidden><svg><use href="#i-down"/></svg></button>
 

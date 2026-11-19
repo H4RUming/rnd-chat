@@ -23,9 +23,14 @@ class Llm:
 
 @dataclass(frozen=True)
 class Agent:
-    max_steps: int = 12
-    tool_result_chars: int = 24000
+    max_steps: int = 24
+    tool_result_chars: int = 100000
+    sweep_max_items: int = 5000          # 전체 확인(review_all)이 한 번에 넘겨 보는 자료 수의 상한
+    sweep_seconds: float = 600.0         # 전체 확인 한 번에 쓰는 시간의 상한
+    turn_result_chars: int = 300000      # 질문 하나에서 모델에 넘기는 도구 결과의 합(모델이 한 번에 읽을 수 있는 양을 넘지 않게)
     max_images: int = 4
+    thinking_steps: int = 1              # [llm] thinking 이 켜져 있을 때, 질문마다 앞의 몇 단계까지 속생각을 쓸지(0 이면 모든 단계)
+    thinking_tokens: int = 4000          # 속생각을 쓰는 단계의 길이 상한(속생각 + 답). 넘으면 생각 없이 다시 묻는다
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,30 @@ class Web:
     allowed_hosts: tuple[str, ...] = ('127.0.0.1', 'localhost')   # 이 이름으로 온 요청만 받는다(포트 제외)
     tls_cert: str = ''                   # 인증서와 개인키 파일을 주면 https 로 연다(둘 다 있어야 한다)
     tls_key: str = ''
+
+
+@dataclass(frozen=True)
+class Mail:
+    """메일 보내기(SMTP). username 이 비어 있으면 보내지 않는다."""
+    host: str = 'smtp.gmail.com'
+    port: int = 587
+    username: str = ''
+    password: str = ''
+    sender_name: str = ''
+
+
+@dataclass(frozen=True)
+class Briefing:
+    """아침 브리핑: 계정마다 대화 기록에서 관심사를 뽑아, 정해진 시각에 새 소식을 찾아 정리해 준다."""
+    enabled: bool = False
+    time: str = '10:00'                  # 만들기 시작하는 시각(서버 시간)
+    until: str = '18:00'                 # 이 시각이 지나면 그날 것은 만들지 않는다(서버가 늦게 뜬 날)
+    app_url: str = ''                    # 메일에 넣을 화면 주소(예: https://example.org)
+    refresh_status: str = ''             # 아침 자료 갱신의 결과 파일. 주면 갱신이 끝나기를 기다렸다가 만든다
+    wait_minutes: int = 30               # 갱신을 기다리는 최대 시간
+    history_days: int = 30               # 관심사를 뽑을 때 돌아보는 대화 기간
+    max_interests: int = 5
+    first_years: tuple[int, ...] = ()    # 첫 브리핑에서 돌아볼 연도(비우면 올해와 지난해)
 
 
 @dataclass(frozen=True)
@@ -56,6 +85,8 @@ class Settings:
     users: tuple[dict[str, Any], ...] = ()
     data_dir: str = ''                   # 올린 파일·만든 파일을 두는 곳(설정 파일 옆의 data/)
     rhwp: str = ''                       # 한글 문서 엔진(rhwp) 실행 파일. 비워 두면 PATH 에서 찾는다
+    mail: Mail = Mail()
+    briefing: Briefing = Briefing()
 
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> 'Settings':
@@ -82,9 +113,14 @@ class Settings:
                     temperature=_number(llm, 'temperature', 0.3, 0.0, 2.0), max_tokens=int(_number(llm, 'max_tokens', 4096, 64, 65536)),
                     timeout=_number(llm, 'timeout', 300.0, 5.0, 3600.0),
                     thinking={True: 'on', False: 'off'}[_flag(llm, 'thinking', True)] if 'thinking' in llm else ''),
-            agent=Agent(max_steps=int(_number(agent, 'max_steps', 12, 1, 50)),
-                        tool_result_chars=int(_number(agent, 'tool_result_chars', 24000, 1000, 400000)),
-                        max_images=int(_number(agent, 'max_images', 4, 0, 16))),
+            agent=Agent(max_steps=int(_number(agent, 'max_steps', 24, 1, 100)),
+                        tool_result_chars=int(_number(agent, 'tool_result_chars', 100000, 1000, 400000)),
+                        turn_result_chars=int(_number(agent, 'turn_result_chars', 300000, 10000, 2000000)),
+                        sweep_max_items=int(_number(agent, 'sweep_max_items', 5000, 100, 200000)),
+                        sweep_seconds=_number(agent, 'sweep_seconds', 600.0, 10.0, 7200.0),
+                        max_images=int(_number(agent, 'max_images', 4, 0, 16)),
+                        thinking_steps=int(_number(agent, 'thinking_steps', 1, 0, 50)),
+                        thinking_tokens=int(_number(agent, 'thinking_tokens', 4000, 256, 65536))),
             servers=tuple(servers),
             web=Web(host=str(web.get('host') or '127.0.0.1'), port=int(_number(web, 'port', 8080, 1, 65535)),
                     session_hours=_number(web, 'session_hours', 12.0, 0.1, 720.0),
@@ -94,7 +130,35 @@ class Settings:
                     **_tls(web, appconfig.config_path(path).parent)),
             users=tuple(entry for entry in config.get('users', []) if isinstance(entry, dict)),
             data_dir=str(appconfig.config_path(path).parent / 'data'),
-            rhwp=_program(_table(config, 'documents'), 'rhwp', appconfig.config_path(path).parent))
+            rhwp=_program(_table(config, 'documents'), 'rhwp', appconfig.config_path(path).parent),
+            mail=_mail(_table(config, 'mail')), briefing=_briefing(_table(config, 'briefing')))
+
+
+def _clock(table: dict[str, Any], name: str, default: str) -> str:
+    value = str(table.get(name, default)).strip()
+    hours, _, minutes = value.partition(':')
+    if not (hours.isdigit() and minutes.isdigit() and int(hours) < 24 and int(minutes) < 60):
+        raise ValueError(f'설정 {name} 은 "10:00" 같은 시각이어야 합니다')
+    return f'{int(hours):02d}:{int(minutes):02d}'
+
+
+def _mail(table: dict[str, Any]) -> Mail:
+    return Mail(host=str(table.get('host') or 'smtp.gmail.com').strip(), port=int(_number(table, 'port', 587, 1, 65535)),
+                username=str(table.get('username') or '').strip(), password=str(table.get('password') or '').replace(' ', ''),
+                sender_name=str(table.get('sender_name') or '').strip())
+
+
+def _briefing(table: dict[str, Any]) -> Briefing:
+    years = table.get('first_years', [])
+    if not isinstance(years, list) or not all(isinstance(year, int) and 2000 <= year <= 2100 for year in years):
+        raise ValueError('설정 [briefing] first_years 는 연도 목록이어야 합니다')
+    app_url = str(table.get('app_url') or '').strip().rstrip('/')
+    if app_url and urlsplit(app_url).scheme not in ('http', 'https'):
+        raise ValueError('설정 [briefing] app_url 은 주소여야 합니다')
+    return Briefing(enabled=_flag(table, 'enabled', False), time=_clock(table, 'time', '10:00'), until=_clock(table, 'until', '18:00'),
+                    app_url=app_url, refresh_status=str(table.get('refresh_status') or '').strip(),
+                    wait_minutes=int(_number(table, 'wait_minutes', 30, 0, 600)), history_days=int(_number(table, 'history_days', 30, 1, 365)),
+                    max_interests=int(_number(table, 'max_interests', 5, 1, 12)), first_years=tuple(years))
 
 
 def _table(config: dict[str, Any], name: str) -> dict[str, Any]:
