@@ -1,7 +1,9 @@
 """로그인: 설정 파일의 계정, 비밀번호 대조, 로그인 시도 제한, 서버 쪽 세션.
 
 계정은 설정 파일의 `[[users]]` 에 직접 적는다. 비밀번호는 `python -m chat.passwd` 로 만든 해시(`password_hash`)를
-권하고, 평문(`password`)도 받는다. 세션은 서버 메모리에만 두며 쿠키에는 무작위 토큰만 실린다.
+권하고, 평문(`password`)도 받는다. 쿠키에는 무작위 토큰만 실린다. 세션은 서버 메모리에 두고, 보관할 곳(대화를 남기는
+파일)이 있으면 거기에도 적어 서버를 다시 띄워도 로그인이 유지되게 한다. 파일에는 토큰이 아니라 토큰의 해시를 적으며,
+그 계정의 비밀번호가 바뀌거나 계정이 없어지면 남아 있던 세션은 버린다.
 """
 from __future__ import annotations
 
@@ -48,6 +50,7 @@ class User:
 class Users:
     def __init__(self, entries: list[dict[str, Any]]):
         self._users: dict[str, User] = {}
+        self._stamps: dict[str, str] = {}
         for entry in entries:
             name = str(entry.get('name') or '').strip()
             hashed, plain = str(entry.get('password_hash') or ''), str(entry.get('password') or '')
@@ -62,10 +65,38 @@ class Users:
     def __len__(self) -> int:
         return len(self._users)
 
+    def taken(self, name: str) -> bool:
+        """그 이름을 이미 쓰는 계정이 있는지(대소문자만 다른 이름도 같은 것으로 본다)."""
+        return name.casefold() in {known.casefold() for known in self._users}
+
+    def add(self, name: str, password_hash: str) -> bool:
+        """가입 신청이 승인된 계정을 더한다. 이름이 겹치면 더하지 않는다."""
+        if self.taken(name) or not password_hash.startswith('scrypt$'):
+            return False
+        self._users[name] = User(name, password_hash)
+        return True
+
+    def remove(self, name: str) -> None:
+        self._users.pop(name, None)
+        self._stamps.pop(name, None)
+
     @property
     def plaintext(self) -> list[str]:
         """비밀번호를 평문으로 적어 둔 계정 이름(경고용)."""
         return [user.name for user in self._users.values() if user.password]
+
+    def stamp(self, name: str) -> str:
+        """그 계정의 비밀번호에서 만든 표식(없는 계정이면 빈 글). 남겨 둔 세션이 지금 비밀번호로 만든 것인지 가리는 데 쓴다.
+        평문 비밀번호는 표식에서 거꾸로 맞혀 보기 어렵게 scrypt 를 거친다."""
+        user = self._users.get(name)
+        if user is None:
+            return ''
+        if name not in self._stamps:
+            secret = user.password_hash.encode() if user.password_hash else hashlib.scrypt(
+                user.password.encode(), salt=hashlib.sha256(f'rnd-chat session {name}'.encode()).digest()[:16],
+                n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, maxmem=2 ** 27, dklen=32)
+            self._stamps[name] = hashlib.sha256(b'rnd-chat session stamp\0' + secret).hexdigest()[:32]
+        return self._stamps[name]
 
     def verify(self, name: str, password: str) -> bool:
         user = self._users.get(name)
@@ -110,33 +141,69 @@ class Session:
     seen: float
     busy: bool = False                               # 질문 하나를 처리하는 중인지
     data: dict[str, Any] = field(default_factory=dict)
+    stamp: str = ''                                  # 로그인할 때의 비밀번호 표식(Users.stamp)
+
+
+def _key(token: str) -> str:
+    """세션을 찾는 열쇠. 보관 파일에 토큰을 그대로 두지 않으려고 해시로 찾는다."""
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 class Sessions:
-    def __init__(self, idle: float = 12 * 3600.0, lifetime: float = 7 * 86400.0, per_user: int = 5,
-                 clock: Callable[[], float] = time.monotonic):
-        self.idle, self.lifetime, self.per_user, self._clock = idle, lifetime, per_user, clock
-        self._sessions: dict[str, Session] = {}
+    """store: 세션을 남길 곳(sessions, save_session, touch_session, delete_session 이 있는 것). 없으면 메모리에만 둔다.
+    valid(user, stamp): 남아 있던 세션을 받아들일지(계정이 그대로 있고 비밀번호가 바뀌지 않았는지)."""
+    TOUCH = 300.0                                    # 마지막으로 쓴 때를 파일에 고쳐 적는 간격(요청마다 적지 않는다)
 
-    def create(self, user: str) -> str:
+    def __init__(self, idle: float = 12 * 3600.0, lifetime: float = 7 * 86400.0, per_user: int = 5,
+                 clock: Callable[[], float] = time.time, store: Any = None, valid: Callable[[str, str], bool] | None = None):
+        self.idle, self.lifetime, self.per_user, self._clock, self._store = idle, lifetime, per_user, clock, store
+        self._sessions: dict[str, Session] = {}
+        self._written: dict[str, float] = {}
+        now = clock()
+        for key, user, created, seen, stamp in (store.sessions() if store is not None else []):
+            if now - seen > idle or now - created > lifetime or (valid is not None and not valid(user, stamp)):
+                store.delete_session(key)
+            else:
+                self._sessions[key] = Session(user, created, seen, stamp=stamp)
+                self._written[key] = seen
+
+    def _drop(self, key: str) -> None:
+        if self._sessions.pop(key, None) is not None and self._store is not None:
+            self._store.delete_session(key)
+        self._written.pop(key, None)
+
+    def create(self, user: str, stamp: str = '') -> str:
         now = self._clock()
         mine = sorted((item for item in self._sessions.items() if item[1].user == user), key=lambda item: item[1].seen)
-        for token, _ in mine[:max(0, len(mine) - self.per_user + 1)]:      # 한 계정의 세션 수를 묶는다(오래된 것부터 끊음)
-            del self._sessions[token]
+        for key, _ in mine[:max(0, len(mine) - self.per_user + 1)]:        # 한 계정의 세션 수를 묶는다(오래된 것부터 끊음)
+            self._drop(key)
         token = secrets.token_urlsafe(32)
-        self._sessions[token] = Session(user, now, now)
+        self._sessions[_key(token)] = Session(user, now, now, stamp=stamp)
+        if self._store is not None:
+            self._store.save_session(_key(token), user, now, now, stamp)
+            self._written[_key(token)] = now
         return token
 
     def get(self, token: str | None) -> Session | None:
-        session = self._sessions.get(token or '')
+        key = _key(token) if token else ''
+        session = self._sessions.get(key)
         if session is None:
             return None
         now = self._clock()
         if now - session.seen > self.idle or now - session.created > self.lifetime:
-            del self._sessions[token]
+            self._drop(key)
             return None
         session.seen = now
+        if self._store is not None and now - self._written.get(key, 0.0) > self.TOUCH:
+            self._store.touch_session(key, now)
+            self._written[key] = now
         return session
 
     def delete(self, token: str | None) -> None:
-        self._sessions.pop(token or '', None)
+        if token:
+            self._drop(_key(token))
+
+    def drop_user(self, user: str) -> None:
+        """그 계정의 세션을 모두 끊는다(계정을 지울 때)."""
+        for key in [key for key, session in self._sessions.items() if session.user == user]:
+            self._drop(key)

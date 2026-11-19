@@ -71,6 +71,19 @@ def render(markdown: str, sources: list[dict[str, Any]], title: str, link: str =
     return page, plain
 
 
+def notice(title: str, rows: list[tuple[str, str]], link: str = '', link_label: str = '') -> tuple[str, str]:
+    """짧은 알림 메일(가입 신청, 승인). rows: (이름표, 값). 값은 사람이 넣은 글이라 모두 이스케이프한다."""
+    lines = ''.join(f'<tr><td style="padding:5px 18px 5px 0;color:{_SOFT};white-space:nowrap">{html.escape(label)}</td>'
+                    f'<td style="padding:5px 0">{html.escape(value)}</td></tr>' for label, value in rows)
+    button = (f'<p style="margin:24px 0 0"><a href="{html.escape(link)}" style="display:inline-block;padding:10px 18px;border-radius:20px;'
+              f'background:{_ACCENT};color:#ffffff;text-decoration:none;font-size:14px">{html.escape(link_label or link)}</a></p>') if link else ''
+    page = (f'<div style="{_FONT};color:{_INK};font-size:14px;max-width:560px;margin:0 auto;padding:8px 4px">'
+            f'<h2 style="margin:0 0 14px;font-size:20px">{html.escape(title)}</h2>'
+            f'<table cellspacing="0" cellpadding="0" style="border-collapse:collapse">{lines}</table>{button}</div>')
+    plain = title + '\n\n' + '\n'.join(f'{label}: {value}' for label, value in rows) + (f'\n\n{link}' if link else '')
+    return page, plain
+
+
 def message(mail: Mail, to: str, subject: str, page: str, plain: str) -> EmailMessage:
     letter = EmailMessage()
     letter['From'] = formataddr((mail.sender_name, mail.username)) if mail.sender_name else mail.username

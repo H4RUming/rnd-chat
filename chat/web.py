@@ -15,13 +15,15 @@ import argparse
 import asyncio
 from collections import OrderedDict
 import contextlib
-from datetime import datetime
+from datetime import datetime, timedelta
+import hmac
 import html
 import json
 import logging
 from pathlib import Path
 import re
 import secrets
+import sqlite3
 import sys
 import tempfile
 import time
@@ -29,14 +31,15 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import quote, urlsplit
 
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import agent, brief, docs, editing, files as filestore, hwp, mailer, storage, sweep
-from .auth import Session, Sessions, Throttle, Users
+from . import agent, brief, docs, editing, files as filestore, hwp, mailer, storage, sweep, tasks
+from .auth import Session, Sessions, Throttle, Users, hash_password
 from .llm import Client, LlmError
 from .localtools import NAMES as LOCAL_TOOLS, LocalTools
 from .settings import Settings
@@ -48,16 +51,23 @@ COOKIE = 'rnd_session'
 API_HEADER, API_HEADER_VALUE = 'x-requested-with', 'rnd-chat'
 STATIC = Path(__file__).resolve().parent / 'static'
 _JS, _CSS, _FONT = 'text/javascript; charset=utf-8', 'text/css; charset=utf-8', 'font/woff2'
-STATIC_FILES = {'app.js': _JS, 'theme.js': _JS, 'login.js': _JS, 'base.css': _CSS, 'login.css': _CSS, 'app.css': _CSS,
+STATIC_FILES = {'app.js': _JS, 'theme.js': _JS, 'login.js': _JS, 'backdrop.js': _JS, 'signup.js': _JS, 'base.css': _CSS, 'login.css': _CSS, 'app.css': _CSS,
                 'd2coding-400.woff2': _FONT, 'd2coding-700.woff2': _FONT, 'd2coding-400-all.woff2': _FONT, 'd2coding-700-all.woff2': _FONT}
 MAX_CONVERSATIONS, MAX_MESSAGES, CONTEXT_MESSAGES = 50, 200, 20
 MAX_ATTACHMENTS, EARLIER_PDF_TEXT, EARLIER_OUTLINE = 3, 8000, 5000
+ASSISTANT_SOURCES = 900          # 비서 대화가 들고 있는 출처 수(답이 가리키는 것만 남기며 이어 쓴다)
+MAX_SUGGESTIONS = 3              # 대화 기록에서 뽑아 권하는 일을 한 번에 몇 개까지 보여 줄지
 PAGE_WIDTHS = {'thumb': 420, 'full': 1500}
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; "
        "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
-LOGIN_ERRORS = {'1': '이름 또는 비밀번호가 맞지 않습니다.', 'locked': '로그인 시도가 많아 잠시 잠겼습니다. 잠시 뒤 다시 해 보세요.',
+LOGIN_ERRORS = {'1': '아이디 또는 비밀번호가 맞지 않습니다.', 'locked': '로그인 시도가 많아 잠시 잠겼습니다. 잠시 뒤 다시 해 보세요.',
                 'origin': '요청을 확인하지 못했습니다. 이 페이지에서 다시 로그인해 주세요.'}
 LOGIN_ERROR_MARK = '<!--error-->'
+SIGNUP_MARK = '<!--signup-->'
+SIGNUP_LINK = '<a class="alt" href="/signup">회원가입</a>'
+SIGNUP_NAME = re.compile(r'[A-Za-z0-9가-힣][A-Za-z0-9가-힣._-]{1,31}')
+SIGNUP_EMAIL = re.compile(r'[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+')
+MIN_PASSWORD = 8
 
 Runner = Callable[[list[dict[str, Any]], agent.Listener, Any], Awaitable[agent.Outcome]]
 
@@ -118,7 +128,7 @@ class Conversations:
         found: list[dict[str, Any]] = []
         for item in reversed(self._data.get(user, {}).values()) if words else ():
             texts = [' '.join(_MARKUP.sub(' ', str(message.get('content') or '')).split()) for index, message in enumerate(item['messages'])
-                     if not (item.get('kind') == 'brief' and index == 0)]
+                     if not (item.get('kind') == 'brief' and index == 0) and not message.get('auto')]      # 사용자가 쓰지 않은 글(실행 지시)은 찾지 않는다
             if not all(word in '\n'.join([item['title'], *texts]).lower() for word in words):
                 continue
             entry = {'id': item['id'], 'title': item['title'], 'updated': item['updated'], **({'kind': item['kind']} if item.get('kind') else {})}
@@ -132,6 +142,31 @@ class Conversations:
             if len(found) >= limit:
                 break
         return found
+
+    def assistant(self, user: str) -> dict[str, Any]:
+        """그 계정의 비서 대화(하나뿐이다). 없으면 만든다."""
+        mine = self._data.setdefault(user, OrderedDict())
+        found = next((item for item in mine.values() if item.get('kind') == 'assistant'), None)
+        if found is None:
+            found = {'id': secrets.token_urlsafe(9), 'title': '비서', 'messages': [], 'updated': time.time(), 'sources': [], 'kind': 'assistant'}
+            mine[found['id']] = found
+            self._keep(user, found)
+        return found
+
+    def tidy(self, user: str, conversation_id: str) -> None:
+        """오래 이어지는 대화에서, 남아 있는 답이 가리키지 않는 출처를 덜어 낸다."""
+        item = self.get(user, conversation_id)
+        if item is not None:
+            cited = set().union(*(cited_numbers(message['content']) for message in item['messages'] if message['role'] == 'assistant'))
+            Sources(item['sources']).prune(cited)
+            self._keep(user, item)
+
+    def users(self) -> list[str]:
+        return list(self._data)
+
+    def purge(self, user: str) -> None:
+        """그 계정의 대화를 메모리에서 지운다(파일 쪽은 Database.forget 이 지운다)."""
+        self._data.pop(user, None)
 
     def files(self, user: str) -> dict[str, dict[str, str]]:
         """대화에 실린 파일이 어느 대화에 있는지(파일 id → 그 대화의 id 와 제목)."""
@@ -190,7 +225,8 @@ class Conversations:
         return item
 
     def append(self, user: str, conversation_id: str | None, question: str, answer: str, attached: list | None = None,
-               files: list | None = None, sources: list | None = None, **extra: Any) -> dict[str, Any]:
+               files: list | None = None, sources: list | None = None, auto: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
+        """질문과 답 한 쌍을 잇는다. auto: 사용자가 쓴 질문이 아니라 맡긴 일의 실행 지시일 때 그 일의 정보(화면은 말풍선 대신 이름표로 보인다)."""
         mine = self._data.setdefault(user, OrderedDict())
         item = mine.get(conversation_id or '')
         if item is None:
@@ -199,10 +235,11 @@ class Conversations:
                     'sources': sources if sources is not None else []}
             mine[item['id']] = item
             while len(mine) > MAX_CONVERSATIONS:
-                dropped, _ = mine.popitem(last=False)
+                dropped = next(key for key, kept in mine.items() if kept.get('kind') != 'assistant')      # 비서 대화는 밀려나지 않는다
+                del mine[dropped]
                 if self._database:
                     self._database.delete(user, dropped)
-        item['messages'] += [_message('user', question, attached), _message('assistant', answer, files, **extra)]
+        item['messages'] += [_message('user', question, attached, auto=auto), _message('assistant', answer, files, **extra)]
         del item['messages'][:-MAX_MESSAGES]
         item['updated'] = time.time()
         mine.move_to_end(item['id'])
@@ -278,12 +315,19 @@ def _brief_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def create_app(settings: Settings, users: Users, runner: Runner | None = None, hub: Hub | None = None,
                sessions: Sessions | None = None, throttle: Throttle | None = None, ip_throttle: Throttle | None = None) -> Starlette:
     web = settings.web
-    sessions = sessions or Sessions(idle=web.session_hours * 3600.0)
     throttle = throttle or Throttle()                        # 계정별
     # 접속 IP 별 한도는 훨씬 느슨하게 둔다: 한 사무실이 같은 IP 를 쓰고, 터널 뒤에서는 모두가 한 IP 로 보일 수 있다
     ip_throttle = ip_throttle or Throttle(limit=throttle.limit * 4, lock=throttle.lock, max_lock=throttle.max_lock)
     # 자료 폴더가 정해져 있으면 대화를 파일에 남기고, 대화가 가리키는 파일(올린 것·만든 것)도 다시 띄울 때 지우지 않는다
     database = storage.Database(Path(settings.data_dir) / 'chat.sqlite3') if settings.data_dir else None
+    signup = settings.signup
+    signup_open = signup.enabled and database is not None       # 신청을 남길 곳이 있어야 받는다
+    for account in (database.accounts('active') if database is not None else []):       # 가입 신청이 승인된 계정들
+        if not users.add(account['name'], account['password_hash']):
+            log.warning('가입으로 등록된 계정 %r 은 설정의 계정과 이름이 겹쳐 쓰지 않습니다', account['name'])
+    # 세션도 거기에 남겨, 서버를 다시 띄워도 로그인이 풀리지 않게 한다(비밀번호가 바뀌었거나 없어진 계정의 세션은 버린다)
+    sessions = sessions or Sessions(idle=web.session_hours * 3600.0, store=database,
+                                    valid=lambda user, stamp: bool(stamp) and hmac.compare_digest(stamp, users.stamp(user)))
     conversations = Conversations(database)
     store = filestore.FileStore(Path(settings.data_dir or tempfile.mkdtemp(prefix='rndchat-')) / 'files', clean=database is None)
     previews = filestore.Previews(store)
@@ -310,37 +354,66 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
         return outcome
     run = runner or default_runner
 
-    # ── 아침 브리핑 ──────────────────────────────────────────────────────────
+    # ── 비서: 맡긴 일을 정해진 때에 해서 비서 대화에 올린다 ─────────────────────────
     briefing = settings.briefing
-    receivers = {str(entry.get('name')): str(entry.get('email') or '').strip() for entry in settings.users
-                 if str(entry.get('email') or '').strip() or entry.get('brief') is True}        # 브리핑을 받는 계정 → 메일 주소(없으면 화면으로만)
-    making: set[str] = set()
+    desk_on = briefing.enabled and database is not None          # 맡긴 일을 남길 곳이 있어야 한다
+    emails = {str(entry.get('name')): str(entry.get('email') or '').strip() for entry in settings.users if str(entry.get('email') or '').strip()}
+    for account in (database.accounts('active') if database is not None else []):
+        emails.setdefault(account['name'], account['email'])
+    running: set[tuple[str, str]] = set()                        # 지금 하고 있는 일 (계정, 일 id)
+
+    def mail_ok(user: str) -> bool:
+        return bool(emails.get(user) and settings.mail.username)
 
     def profile_of(user: str) -> dict[str, Any]:
-        """계정의 브리핑 설정: interests(챙겨 볼 주제), muted(사용자가 뺀 주제), paused(아침마다 받지 않음)."""
+        """계정에 딸린 것: notes(비서의 메모), suggestions(권하는 일), muted(권하지 말라고 한 주제), suggested(마지막으로 권할 것을 찾은 날)."""
         data = database.profile(user) if database is not None else {}
         data.pop('updated', None)
         return data
 
-    async def make_brief(user: str, day: str) -> dict[str, Any]:
-        """그 계정의 그날 브리핑을 만든다: 관심사 뽑기 → 찾아서 쓰기 → 대화로 남기기 → 메일."""
-        making.add(user)
-        database.save_brief(user, day, 'running', time.time(), attempt=True)
+    def keep_profile(user: str, **changes: Any) -> dict[str, Any]:
+        data = {**profile_of(user), **changes}
+        database.save_profile(user, data, time.time())
+        return data
+
+    def notes_of(user: str) -> list[dict[str, Any]]:
+        return [entry for entry in profile_of(user).get('notes') or [] if isinstance(entry, dict) and entry.get('id') and entry.get('text')]
+
+    def desk_for(user: str) -> tasks.Desk:
+        return tasks.Desk(lambda: database.tasks(user), lambda task: database.save_task(user, task), lambda task_id: database.delete_task(user, task_id),
+                          briefing.max_tasks, mail_ok(user), briefing.time, notes=lambda: notes_of(user), keep_notes=lambda notes: keep_profile(user, notes=notes), earliest=briefing.refresh_time)
+
+    if database is not None:                                     # 예전 아침 브리핑의 주제를 맡긴 일 하나로 옮긴다(한 번만)
+        for owner, profile in database.profiles().items():
+            if profile.get('moved'):
+                continue
+            moved = tasks.from_interests(profile.get('interests') or [], briefing.time, bool(emails.get(owner)), bool(profile.get('paused')))
+            if moved and not database.tasks(owner):
+                moved['last_ok'] = database.last_done(owner, '9999-12-31')
+                database.save_task(owner, moved)
+                log.info('brief topics moved to a task user=%s', owner)
+            database.save_profile(owner, {**profile, 'moved': True}, time.time())
+
+    async def run_task(user: str, task_id: str, day: str, force: bool = False) -> dict[str, Any] | None:
+        """맡긴 일 하나를 한다: 찾아서 쓰기 → (알릴 것이 있으면) 비서 대화에 올리기 → 메일. force: 화면에서 지금 하라고 한 것(새 것이 없어도 올린다)."""
+        def stored() -> dict[str, Any] | None:
+            return next((task for task in database.tasks(user) if task['id'] == task_id), None)
+        task = stored()
+        if task is None or (user, task_id) in running:
+            return None
+        running.add((user, task_id))
+        earlier = task.get('last') or {}
+        attempts = int(earlier.get('attempts') or 0) + 1 if earlier.get('day') == day else 1
+        database.save_task(user, {**task, 'last': {'day': day, 'status': 'running', 'at': time.time(), 'note': '', 'attempts': attempts}})
+
+        def finish(status: str, note: str = '', **more: Any) -> None:
+            fresh = stored()                                     # 하는 동안 사용자가 고치거나 지웠을 수 있다
+            if fresh is not None:
+                database.save_task(user, {**fresh, **more, 'last': {'day': day, 'status': status, 'at': time.time(), 'note': note[:300], 'attempts': attempts}})
+        created: list[dict[str, Any]] = []
         try:
-            questions = brief.asked(conversations.items(user), time.time(), briefing.history_days)
-            if state['llm'] is None:
-                state['llm'] = Client(settings.llm)
-            profile = profile_of(user)
-            stored, muted = profile.get('interests') or [], profile.get('muted') or []
-            found = await brief.interests(state['llm'], questions, stored, briefing.max_interests, muted) if questions else []
-            # 사용자가 직접 정한 주제는 대화가 없어도 남고, 대화에서 뽑은 주제는 그 뒤에 잇는다
-            topics = brief.merge([item for item in stored if item.get('pinned')], found, muted, briefing.max_interests)
-            if not topics:
-                database.save_brief(user, day, 'skipped', time.time(), note='챙겨 볼 주제를 찾을 만한 대화가 아직 없습니다')
-                return database.brief(user, day)
-            database.save_profile(user, {**profile_of(user), 'interests': topics}, time.time())
+            item = conversations.assistant(user)
             steps: list[dict[str, Any]] = []
-            created: list[dict[str, Any]] = []
 
             async def listen(event: dict[str, Any]) -> None:
                 if event['type'] == 'file':
@@ -349,38 +422,51 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                     steps.append({'name': event['name'], 'args': _brief_arguments(event['arguments'])})
                 elif event['type'] == 'tool_result' and steps:
                     steps[-1].update(is_error=event['is_error'], summary=event.get('summary') or {})
-            sources = Sources([])
+            sources = Sources(item['sources'], limit=ASSISTANT_SOURCES)
             local = LocalTools(store, user, previews, sources)
-            label = brief.title(day)
+            order = tasks.instruction(task, day, str(task.get('last_ok') or ''), notes_of(user))
             async with gate:
                 started = time.monotonic()
-                outcome = await asyncio.wait_for(run([{'role': 'user', 'content': brief.instruction(
-                    topics, day, database.last_done(user, day), briefing.first_years)}], listen, local), timeout=1800)
-            if not outcome.answer.strip():
-                raise RuntimeError('브리핑 글이 비어 있습니다')
-            item = conversations.append(user, None, label, outcome.answer, None, _latest_files(created), sources.items,
-                                        steps=steps, seconds=round(time.monotonic() - started, 1))
-            conversations.mark(user, item['id'], kind='brief', title=label)
-            mailed, note = '', ''
-            if receivers.get(user) and settings.mail.username:
+                outcome = await asyncio.wait_for(run([{'role': 'user', 'content': order}], listen, local), timeout=1800)
+            answer = outcome.answer.strip()
+            if not answer:
+                raise RuntimeError('결과 글이 비어 있습니다')
+            known = {source['n']: source['url'] for source in sources.items}
+            cited = [known[number] for number in sorted(cited_numbers(answer)) if number in known]
+            kept = {'last_ok': day, 'seen': tasks.remember(task, cited)}
+            if not force and tasks.nothing_new(task, answer, cited):
+                for meta in created:                             # 올리지 않는 결과가 만든 파일은 남기지 않는다
+                    store.delete(user, meta['id'])
+                conversations.tidy(user, item['id'])
+                finish('quiet', **kept)
+                log.info('task quiet user=%s task=%r', user, task['title'])
+                return stored()
+            conversations.append(user, item['id'], order, answer, None, _latest_files(created), auto={'task': task_id, 'title': task['title'], 'day': day},
+                                 steps=steps, seconds=round(time.monotonic() - started, 1))
+            conversations.tidy(user, item['id'])
+            note = ''
+            if task.get('mail') and mail_ok(user):
                 try:
-                    page, plain = mailer.render(outcome.answer, sources.items, label, briefing.app_url)
-                    await asyncio.to_thread(mailer.send, settings.mail, receivers[user], label, page, plain)
-                    mailed = receivers[user]
-                except Exception as exc:                 # 메일이 안 가도 브리핑은 화면에 남는다
+                    label = f'{task["title"]} · {int(day[5:7])}월 {int(day[8:10])}일'
+                    page, plain = mailer.render(answer, sources.items, label, briefing.app_url)
+                    await asyncio.to_thread(mailer.send, settings.mail, emails[user], label, page, plain)
+                    note = 'mailed'
+                except Exception as exc:                         # 메일이 안 가도 결과는 대화에 남는다
                     note = f'메일을 보내지 못했습니다: {type(exc).__name__}'
-                    log.warning('brief mail failed user=%s error=%s', user, type(exc).__name__)
-            database.save_brief(user, day, 'done', time.time(), conversation_id=item['id'], mailed=mailed, note=note)
-            log.info('brief done user=%s day=%s topics=%d steps=%d mailed=%s', user, day, len(topics), len(steps), bool(mailed))
+                    log.warning('task mail failed user=%s error=%s', user, type(exc).__name__)
+            finish('done', note, **kept)
+            log.info('task done user=%s task=%r steps=%d mailed=%s', user, task['title'], len(steps), note == 'mailed')
         except Exception as exc:
-            log.exception('brief failed user=%s', user)
-            database.save_brief(user, day, 'error', time.time(), note=f'{type(exc).__name__}: {str(exc)[:200]}')
+            log.exception('task failed user=%s task=%s', user, task_id)
+            for meta in created:
+                store.delete(user, meta['id'])
+            finish('error', '모델 서버가 답하지 않았습니다' if isinstance(exc, (LlmError, asyncio.TimeoutError)) else f'{type(exc).__name__}: {str(exc)[:200]}')
         finally:
-            making.discard(user)
-        return database.brief(user, day)
+            running.discard((user, task_id))
+        return stored()
 
     def refresh_pending(now: datetime) -> bool:
-        """오늘 자료 갱신이 시작됐는데 아직 안 끝났는가(끝나기를 조금 기다렸다가 브리핑을 만든다)."""
+        """오늘 자료 갱신이 시작됐는데 아직 안 끝났는가(끝나기를 조금 기다렸다가 일을 한다)."""
         if not briefing.refresh_status:
             return False
         try:
@@ -389,25 +475,86 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return False
         return str(status.get('started', '')).startswith(now.strftime('%Y-%m-%d')) and not status.get('finished')
 
-    async def brief_tick(now: datetime | None = None) -> list[str]:
-        """만들 때가 된 브리핑을 만든다. 돌려주는 것: 이번에 만든 계정들."""
+    async def task_tick(now: datetime | None = None) -> list[tuple[str, str]]:
+        """할 때가 된 일을 한다. 돌려주는 것: 이번에 한 (계정, 일 이름)들. 서버가 꺼져 있던 시각의 일은 그날 안에 켜지면 그때 한다."""
         now = now or datetime.now()
-        clock, day, made = now.strftime('%H:%M'), now.strftime('%Y-%m-%d'), []
-        if not (briefing.enabled and database is not None and briefing.time <= clock < briefing.until):
+        day, made = now.strftime('%Y-%m-%d'), []
+        if not desk_on:
             return made
-        hours, minutes = (int(part) for part in briefing.time.split(':'))
-        if refresh_pending(now) and (now.hour * 60 + now.minute) - (hours * 60 + minutes) < briefing.wait_minutes:
-            return made
-        for user in receivers:
-            if profile_of(user).get('paused'):               # 화면에서 꺼 둔 계정(지금 받기는 된다)
+        waiting = refresh_pending(now)
+        for user, mine in database.tasks().items():
+            if not users.taken(user):                            # 없어진 계정의 일은 하지 않는다
                 continue
-            record = database.brief(user, day)
-            stale = record and record['status'] == 'running' and user not in making and time.time() - record['updated'] > 3600       # 만들다 서버가 꺼진 것
-            again = record and record['status'] == 'error' and record['attempts'] < 3 and time.time() - record['updated'] > 1200
-            if user not in making and (record is None or stale or again):
-                await make_brief(user, day)
-                made.append(user)
+            for task in mine:
+                late = tasks.minutes_late(task, now, briefing.refresh_time)
+                if task.get('paused') or late is None or late < 0 or (user, task['id']) in running or (waiting and late < briefing.wait_minutes):
+                    continue
+                last = task.get('last') or {}
+                stale = last.get('status') == 'running' and time.time() - float(last.get('at') or 0) > 3600      # 하다가 서버가 꺼진 것
+                again = last.get('status') == 'error' and int(last.get('attempts') or 0) < 3 and time.time() - float(last.get('at') or 0) > 1200
+                if last.get('day') != day or stale or again:
+                    await run_task(user, task['id'], day)
+                    made.append((user, task['title']))
+        if now.strftime('%H:%M') >= max(briefing.time, briefing.refresh_time):
+            for user in conversations.users():
+                if users.taken(user):
+                    try:
+                        await suggest_for(user, day)
+                    except Exception:
+                        log.exception('suggest failed user=%s', user)
         return made
+
+    async def suggest_for(user: str, day: str) -> list[dict[str, Any]]:
+        """보통 대화에서 거듭 물은 주제 가운데 아직 맡기지 않은 것을 골라 "이것도 챙겨 드릴까요" 하고 권할 거리로 둔다(일을 만들지는 않는다).
+        하루 한 번, 지난번에 찾은 뒤로 새 대화가 있었던 계정만 모델에 묻는다."""
+        profile = profile_of(user)
+        pending = [entry for entry in profile.get('suggestions') or [] if isinstance(entry, dict) and entry.get('topic')]
+        if profile.get('suggested') == day:
+            return pending
+        talks = [item for item in conversations.items(user) if item.get('kind') != 'assistant']
+        newest = max((float(item.get('updated') or 0) for item in talks), default=0.0)
+        changes: dict[str, Any] = {'suggested': day}
+        if len(pending) < MAX_SUGGESTIONS and newest > float(profile.get('suggested_at') or 0):
+            questions = brief.asked(talks, time.time(), briefing.history_days)
+            if len(questions) >= 2:
+                if state['llm'] is None:
+                    state['llm'] = Client(settings.llm)
+                taken = [*(profile.get('muted') or []), *(task['title'] for task in database.tasks(user)), *(entry['topic'] for entry in pending)]
+                found = await brief.interests(state['llm'], questions, [], MAX_SUGGESTIONS, taken)
+                known = {''.join(str(topic).split()).lower() for topic in taken}
+                fresh = [topic for topic in found if ''.join(topic['topic'].split()).lower() not in known][:MAX_SUGGESTIONS - len(pending)]
+                pending = [*pending, *({'id': secrets.token_urlsafe(5), 'day': day, **topic} for topic in fresh)]
+                changes.update(suggestions=pending, suggested_at=time.time())
+                log.info('suggested user=%s new=%d', user, len(fresh))
+        keep_profile(user, **changes)
+        return pending
+
+    def today_of(user: str, now: datetime | None = None) -> dict[str, Any]:
+        """오늘 화면에 보일 것: 올라온 결과의 카드(오늘 것이 없으면 최근 7일 안의 마지막 날 것), 하는 중·소식 없음·실패·예정, 권하는 일."""
+        now = now or datetime.now()
+        day, mine, item = now.strftime('%Y-%m-%d'), database.tasks(user), conversations.assistant(user)
+        feedback = {task['id']: {entry['day']: entry['value'] for entry in task.get('feedback') or []} for task in mine}
+        by_day: dict[str, list[dict[str, Any]]] = {}
+        for index, message in enumerate(item['messages'][:-1]):
+            auto = message.get('auto')
+            if isinstance(auto, dict) and auto.get('day'):
+                by_day.setdefault(auto['day'], []).append({
+                    'index': index, 'task': auto.get('task'), 'title': auto.get('title') or '맡긴 일', 'day': auto['day'],
+                    'summary': tasks.headline(item['messages'][index + 1]['content']), 'kept': auto.get('task') in feedback,
+                    'feedback': feedback.get(auto.get('task'), {}).get(auto['day'], '')})
+        floor = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+        shown = day if day in by_day else max((known for known in by_day if known >= floor), default=day)
+        last = {task['id']: task.get('last') or {} for task in mine}
+        upcoming = sorted(({'title': task['title'], 'time': max(task['time'], briefing.refresh_time)} for task in mine
+                           if not task.get('paused') and (tasks.minutes_late(task, now, briefing.refresh_time) or 0) < 0 and last[task['id']].get('day') != day),
+                          key=lambda entry: entry['time'])
+        return {'today': day, 'day': shown, 'cards': list(reversed(by_day.get(shown, []))),
+                'running': [task['title'] for task in mine if (user, task['id']) in running],
+                'quiet': [task['title'] for task in mine if last[task['id']].get('day') == day and last[task['id']].get('status') == 'quiet'],
+                'errors': [{'task': task['id'], 'title': task['title'], 'note': last[task['id']].get('note') or ''} for task in mine
+                           if last[task['id']].get('day') == day and last[task['id']].get('status') == 'error' and (user, task['id']) not in running],
+                'upcoming': upcoming,
+                'suggestions': [{key: entry.get(key, '') for key in ('id', 'topic', 'kind', 'conditions')} for entry in profile_of(user).get('suggestions') or []]}
 
     async def attachment_text(user: str, meta: dict[str, Any], current: bool) -> tuple[str, list[str]]:
         """첨부 하나를 모델에 설명하는 글과 쪽 그림(지금 질문일 때만). 고칠 수 있는 문서는 좌표가 적힌 개요를 준다."""
@@ -497,8 +644,115 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return RedirectResponse('/', status_code=303)
         message = LOGIN_ERRORS.get(request.query_params.get('error', ''), '')
         error = f'<p class="alert" role="alert">{html.escape(message)}</p>' if message else ''
-        page = (STATIC / 'login.html').read_text(encoding='utf-8').replace(LOGIN_ERROR_MARK, error)
+        page = (STATIC / 'login.html').read_text(encoding='utf-8').replace(LOGIN_ERROR_MARK, error).replace(SIGNUP_MARK, SIGNUP_LINK if signup_open else '')
         return Response(page, media_type='text/html; charset=utf-8')
+
+    # ── 회원가입 신청: 받아만 두고, 관리자가 검토해 등록한다 ─────────────────────
+    asked_at: list[float] = []                               # 최근 한 시간에 받은 신청의 시각(전체)
+    asked_by: dict[str, list[float]] = {}                    # 접속 주소별
+    notify_to = signup.notify or next((str(entry.get('email') or '').strip() for entry in settings.users if entry.get('name') == signup.admin), '')
+
+    def notice_task(to: str, subject: str, page: str, plain: str) -> BackgroundTask | None:
+        """알림 메일을 응답을 보낸 뒤에 보낸다. 못 보내도 신청·승인은 그대로다(화면에서 볼 수 있다)."""
+        if not (to and settings.mail.username):
+            return None
+
+        async def deliver() -> None:
+            try:
+                await asyncio.to_thread(mailer.send, settings.mail, to, subject, page, plain)
+            except Exception as exc:
+                log.warning('notice mail failed subject=%r: %s', subject, type(exc).__name__)
+        return BackgroundTask(deliver)
+
+    async def signup_page(request: Request) -> Response:
+        if not signup_open:
+            return Response('not found', status_code=404)
+        if current(request) is not None:
+            return RedirectResponse('/', status_code=303)
+        return Response((STATIC / 'signup.html').read_bytes(), media_type='text/html; charset=utf-8')
+
+    async def signup_api(request: Request) -> Response:
+        if not signup_open:
+            return JSONResponse({'error': '없는 주소입니다.'}, status_code=404)
+        if not (same_origin(request) and request.headers.get(API_HEADER) == API_HEADER_VALUE):
+            return JSONResponse({'error': '요청을 확인하지 못했습니다.'}, status_code=403)
+        declared = request.headers.get('content-length') or ''
+        if not declared.isdigit() or int(declared) > 4096:   # 로그인하지 않은 사람이 보내는 요청이라 본문을 읽기 전에 크기를 본다
+            return JSONResponse({'error': '요청이 너무 큽니다.'}, status_code=413)
+        try:
+            body = json.loads(await request.body())
+            name, email, password = (str(body.get(key) or '') for key in ('username', 'email', 'password'))
+        except (ValueError, AttributeError):
+            return JSONResponse({'error': '요청을 읽지 못했습니다.'}, status_code=400)
+        name, email = name.strip(), email.strip()
+        if not SIGNUP_NAME.fullmatch(name):
+            return JSONResponse({'error': '아이디는 한글·영문·숫자로 2~32자입니다( . _ - 도 쓸 수 있습니다).', 'field': 'username'}, status_code=400)
+        if len(email) > 120 or not SIGNUP_EMAIL.fullmatch(email):
+            return JSONResponse({'error': '메일 주소를 확인해 주세요.', 'field': 'email'}, status_code=400)
+        if not MIN_PASSWORD <= len(password) <= 256 or password.casefold() == name.casefold():
+            return JSONResponse({'error': f'비밀번호는 {MIN_PASSWORD}자 이상이고 아이디와 달라야 합니다.', 'field': 'password'}, status_code=400)
+        known = database.accounts()
+        if users.taken(name) or name.casefold() in {account['name'].casefold() for account in known}:
+            return JSONResponse({'error': '이미 쓰이고 있는 아이디입니다.', 'field': 'username'}, status_code=409)
+        # 여기부터는 비밀번호 해시 계산(무겁다)과 메일이 따르므로 받는 수를 묶는다
+        now, ip = time.time(), client_ip(request)
+        asked_at[:] = [moment for moment in asked_at if now - moment < 3600]
+        mine = [moment for moment in asked_by.get(ip, []) if now - moment < 3600]
+        if len(asked_by) > 5000:
+            asked_by.clear()
+        waiting = sum(account['status'] == 'pending' for account in known)
+        if len(asked_at) >= signup.per_hour or len(mine) >= max(1, signup.per_hour // 2) or waiting >= signup.max_pending:
+            log.warning('signup refused (limit) ip=%s waiting=%d', ip, waiting)
+            return JSONResponse({'error': '지금은 신청을 받을 수 없습니다. 잠시 뒤 다시 해 보거나 관리자에게 문의해 주세요.'}, status_code=429)
+        asked_at.append(now)
+        asked_by[ip] = mine + [now]
+        hashed = await asyncio.to_thread(hash_password, password)
+        try:
+            database.add_account(name, email, hashed, now)
+        except sqlite3.IntegrityError:                       # 그사이 같은 아이디로 신청이 들어왔다
+            return JSONResponse({'error': '이미 쓰이고 있는 아이디입니다.', 'field': 'username'}, status_code=409)
+        log.info('signup asked name=%r ip=%s', name, ip)
+        page, plain = mailer.notice('가입 신청이 들어왔습니다', [('아이디', name), ('메일', email), ('신청한 때', time.strftime('%Y-%m-%d %H:%M', time.localtime(now)))],
+                                    f'{briefing.app_url}/?view=accounts' if briefing.app_url else '', '검토하러 가기')
+        return JSONResponse({'ok': True}, background=notice_task(notify_to, f'가입 신청: {name}', page, plain))
+
+    async def accounts_api(request: Request) -> Response:
+        """관리자가 가입 신청을 검토한다: 목록, 승인(approve), 거절(reject), 등록된 계정 지우기(remove)."""
+        session = api_guard(request, write=request.method != 'GET')
+        if isinstance(session, Response):
+            return session
+        if not signup_open or session.user != signup.admin:
+            return JSONResponse({'error': '없는 주소입니다.'}, status_code=404)
+        told = None
+        if request.method == 'POST':
+            try:
+                body = json.loads(await request.body())
+                name, action = str(body.get('name') or ''), str(body.get('action') or '')
+            except (ValueError, AttributeError):
+                name = action = ''
+            account = next((entry for entry in database.accounts() if entry['name'] == name), None)
+            if account is None or (action, account['status']) not in (('approve', 'pending'), ('reject', 'pending'), ('remove', 'active')):
+                return JSONResponse({'error': '그 신청이나 계정을 찾지 못했습니다.'}, status_code=404)
+            if action == 'approve':
+                if not users.add(name, account['password_hash']):
+                    return JSONResponse({'error': '이미 쓰이고 있는 아이디라 등록할 수 없습니다. 거절한 뒤 다른 아이디로 신청받으세요.'}, status_code=409)
+                database.activate_account(name, time.time())
+                emails.setdefault(name, account['email'])
+                page, plain = mailer.notice('가입이 승인되었습니다', [('아이디', name)], briefing.app_url, '로그인하러 가기')
+                told = notice_task(account['email'], '가입이 승인되었습니다', page, plain)
+            else:
+                database.delete_account(name)
+                if action == 'remove':                       # 로그인도, 남긴 것도 모두 없앤다(같은 아이디로 다시 가입한 사람이 물려받지 않게)
+                    users.remove(name)
+                    emails.pop(name, None)
+                    sessions.drop_user(name)
+                    conversations.purge(name)
+                    store.purge(name)
+                    database.forget(name)
+            log.info('account %s name=%r by=%s', action, name, session.user)
+        listed = [{key: account[key] for key in ('name', 'email', 'status', 'created', 'decided')} for account in database.accounts()]
+        return JSONResponse({'pending': [entry for entry in listed if entry['status'] == 'pending'],
+                             'active': [entry for entry in listed if entry['status'] == 'active']}, background=told)
 
     async def login(request: Request) -> Response:
         if not same_origin(request):
@@ -517,7 +771,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
         throttle.success(name)
         log.info('login ok user=%s ip=%s', name, ip)
         response = RedirectResponse('/', status_code=303)
-        response.set_cookie(COOKIE, sessions.create(name), max_age=int(sessions.lifetime), httponly=True, samesite='strict',
+        response.set_cookie(COOKIE, sessions.create(name, users.stamp(name)), max_age=int(sessions.lifetime), httponly=True, samesite='strict',
                             secure=is_https(request), path='/')
         return response
 
@@ -535,7 +789,8 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return session
         return JSONResponse({'name': session.user, 'servers': [{'name': server.name, 'ok': server.name not in hub.unavailable}
                                                               for server in hub.servers] if state['refreshed'] else [],
-                             'model': settings.llm.model, 'max_question_chars': web.max_question_chars})
+                             'model': settings.llm.model, 'max_question_chars': web.max_question_chars,
+                             **({'admin': True, 'signups': len(database.accounts('pending'))} if signup_open and session.user == signup.admin else {})})
 
     async def conversation_list(request: Request) -> Response:
         session = api_guard(request, write=False)
@@ -578,7 +833,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return JSONResponse({'error': '없는 대화입니다.'}, status_code=404)
         earlier = previous['messages'] if previous else []
         if regenerate:                               # 마지막 질문을 다시 묻고, 그 답을 새 답으로 바꾼다
-            if len(earlier) < 2 or (previous.get('kind') == 'brief' and len(earlier) == 2):       # 브리핑 글은 질문에서 나온 답이 아니다
+            if len(earlier) < 2 or (previous.get('kind') == 'brief' and len(earlier) == 2) or earlier[-2].get('auto'):       # 브리핑·맡긴 일의 결과는 질문에서 나온 답이 아니다
                 return JSONResponse({'error': '다시 만들 답이 없습니다.'}, status_code=400)
             asked, earlier = earlier[-2], earlier[:-2]
             question, attached = asked['content'], asked.get('files') or []
@@ -616,12 +871,15 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 history.append(await model_message(session.user, _message('user', question, attached), True))
                 if gate.locked():
                     await queue.put({'type': 'queued'})
-                sources = Sources(previous['sources'] if previous else [])
-                local = LocalTools(store, session.user, previews, sources)
+                desk = desk_on and previous is not None and previous.get('kind') == 'assistant'      # 비서 대화에서만 일을 맡길 수 있다
+                sources = Sources(previous['sources'] if previous else [], **({'limit': ASSISTANT_SOURCES} if desk else {}))
+                local = LocalTools(store, session.user, previews, sources, extra=desk_for(session.user) if desk else None)
                 # 앞선 답에서 쓰인 출처 번호를 알려 줘, 이어지는 질문에서도 같은 번호로 가리키게 한다
                 local.system_note = sources.note(set().union(*(cited_numbers(message['content']) for message in earlier if message['role'] == 'assistant')))
                 # 앞선 차례에 무엇을 찾았고 그중 얼마나 봤는지도 알려 준다(앞선 답의 목록에서만 골라 답하지 않게)
                 local.system_note += agent.earlier_searches([message.get('steps') or [] for message in earlier[-CONTEXT_MESSAGES:] if message['role'] == 'assistant'])
+                if desk:
+                    local.system_note += tasks.note(database.tasks(session.user), briefing.max_tasks, mail_ok(session.user), briefing.time, notes=notes_of(session.user))
                 async with gate:
                     started = time.monotonic()
                     outcome = await run(history, listen, local)
@@ -633,6 +891,8 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 else:
                     item = conversations.append(session.user, previous['id'] if previous else None, question, outcome.answer, attached, final,
                                                 sources.items, **record)
+                if desk:
+                    conversations.tidy(session.user, item['id'])
                 await queue.put({'type': 'done', 'conversation_id': item['id'], 'title': item['title'], 'index': len(item['messages']) - 1})
             except LlmError as exc:
                 await queue.put({'type': 'error', 'message': str(exc)})
@@ -818,51 +1078,82 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return JSONResponse({'error': str(exc)}, status_code=400)
         return download(docs.safe_filename(item['title'], kind), kind, data)
 
-    async def brief_api(request: Request) -> Response:
-        """GET: 이 계정의 브리핑 상태·주제·지난 기록. POST: 오늘 브리핑을 지금 만든다(이미 있으면 새로 만든다).
-        PUT: 주제 목록(interests)이나 아침마다 받기를 끌지(paused)를 바꾼다."""
+    def desk_state(user: str) -> dict[str, Any]:
+        mine = database.tasks(user) if desk_on else []
+        item = conversations.assistant(user) if desk_on else None
+        return {'available': desk_on, 'conversation_id': item['id'] if item else '', 'updated': item['updated'] if item else 0,
+                'tasks': [tasks.shown(task, (user, task['id']) in running) for task in mine], 'max_tasks': briefing.max_tasks,
+                'notes': [{key: entry.get(key, '') for key in ('id', 'text', 'by', 'at')} for entry in notes_of(user)] if desk_on else [], 'max_notes': tasks.MAX_NOTES,
+                'today': today_of(user) if desk_on else None,
+                'mail': mail_ok(user), 'to': _masked(emails[user]) if mail_ok(user) else '', 'running': any(owner == user for owner, _ in running),
+                'delivered': max((float((task.get('last') or {}).get('at') or 0) for task in mine if (task.get('last') or {}).get('status') == 'done'), default=0)}
+
+    async def assistant_api(request: Request) -> Response:
+        """GET: 비서 대화의 id, 맡긴 일, 메모, 오늘 화면에 보일 것. POST {id, action, …}: 화면에서 하나를 다룬다 —
+        일: run | pause | resume | delete | mail_on | mail_off | up | down(day 와 함께, 그날 결과에 대한 반응)
+        메모: note_save(text, id 가 있으면 고치기) | note_delete        권한 일: suggest_accept | suggest_dismiss"""
         session = api_guard(request, write=request.method != 'GET')
         if isinstance(session, Response):
             return session
-        user, available = session.user, database is not None and briefing.enabled and session.user in receivers
-        if request.method == 'PUT':
-            if not available:
-                return JSONResponse({'error': '이 계정은 브리핑을 받도록 설정되어 있지 않습니다.'}, status_code=403)
+        user = session.user
+        if request.method == 'POST':
+            if not desk_on:
+                return JSONResponse({'error': '비서를 쓸 수 없게 설정되어 있습니다.'}, status_code=403)
             try:
                 body = json.loads(await request.body() or b'{}')
-                wanted, paused = body.get('interests'), body.get('paused')
+                task_id, action = str(body.get('id') or ''), str(body.get('action') or '')
             except (ValueError, AttributeError):
-                return JSONResponse({'error': '요청 형식이 잘못되었습니다.'}, status_code=400)
-            profile = profile_of(user)
-            if wanted is not None:
-                if not isinstance(wanted, list) or len(wanted) > briefing.max_interests:
-                    return JSONResponse({'error': f'주제는 {briefing.max_interests}개까지입니다.'}, status_code=400)
-                profile['interests'], profile['muted'] = brief.edited(profile.get('interests') or [], profile.get('muted') or [], wanted, briefing.max_interests)
-            if isinstance(paused, bool):
-                profile['paused'] = paused
-            database.save_profile(user, profile, time.time())
-            return JSONResponse({'interests': profile.get('interests') or [], 'paused': bool(profile.get('paused'))})
-        if request.method == 'POST':
-            if not available:
-                return JSONResponse({'error': '이 계정은 브리핑을 받도록 설정되어 있지 않습니다.'}, status_code=403)
-            if user in making:
-                return JSONResponse({'error': '브리핑을 만드는 중입니다.'}, status_code=409)
-            task = asyncio.create_task(make_brief(user, datetime.now().strftime('%Y-%m-%d')))
-            background.add(task)
-            task.add_done_callback(background.discard)
-            return JSONResponse({'status': 'running'}, status_code=202)
-        def shown(record: dict[str, Any]) -> dict[str, Any]:
-            kept = conversations.get(user, record['conversation_id']) is not None         # 지운 브리핑은 열 수 없다
-            return {'day': record['day'], 'title': brief.title(record['day']), 'status': record['status'], 'note': record['note'],
-                    'conversation_id': record['conversation_id'] if kept else '', 'mailed': bool(record['mailed'])}
-        history = [shown(record) for record in database.briefs(user)] if database is not None else []
-        last = database.brief(user) if database is not None else None
-        mailed = bool(receivers.get(user) and settings.mail.username)
-        profile = profile_of(user)
-        return JSONResponse({'available': available, 'time': briefing.time, 'mail': mailed, 'to': _masked(receivers[user]) if mailed else '',
-                             'running': user in making, 'paused': bool(profile.get('paused')), 'max_interests': briefing.max_interests,
-                             'interests': profile.get('interests') or [], 'history': history,
-                             'last': {key: last[key] for key in ('day', 'status', 'conversation_id', 'note')} | {'mailed': bool(last['mailed'])} if last else None})
+                body, task_id, action = {}, '', ''
+            if action in ('note_save', 'note_delete'):           # 메모를 화면에서 고친다
+                notes = notes_of(user)
+                try:
+                    if action == 'note_delete':
+                        if not any(entry['id'] == task_id for entry in notes):
+                            raise tasks.TaskError('그 메모를 찾지 못했습니다')
+                        notes = [entry for entry in notes if entry['id'] != task_id]
+                    else:
+                        notes, _ = tasks.put_note(notes, body.get('text'), task_id, by='user')
+                except tasks.TaskError as exc:
+                    return JSONResponse({'error': str(exc).replace('note_id 의 ', '')}, status_code=400)
+                keep_profile(user, notes=notes)
+                return JSONResponse(desk_state(user))
+            if action in ('suggest_accept', 'suggest_dismiss'):  # 권한 일을 받아들이거나 물린다
+                profile = profile_of(user)
+                pending = profile.get('suggestions') or []
+                picked = next((entry for entry in pending if entry.get('id') == task_id), None)
+                if picked is None:
+                    return JSONResponse({'error': '그 제안을 찾지 못했습니다.'}, status_code=404)
+                changes: dict[str, Any] = {'suggestions': [entry for entry in pending if entry is not picked]}
+                if action == 'suggest_accept':
+                    if len(database.tasks(user)) >= briefing.max_tasks:
+                        return JSONResponse({'error': f'맡을 수 있는 일은 {briefing.max_tasks}개까지입니다.'}, status_code=400)
+                    database.save_task(user, tasks.suggested(picked, briefing.time))
+                else:
+                    changes['muted'] = [*(profile.get('muted') or []), picked['topic']][-30:]      # 다시 권하지 않는다
+                keep_profile(user, **changes)
+                return JSONResponse(desk_state(user))
+            task = next((entry for entry in database.tasks(user) if entry['id'] == task_id), None)
+            if task is None or action not in ('run', 'pause', 'resume', 'delete', 'mail_on', 'mail_off', 'up', 'down'):
+                return JSONResponse({'error': '그 일을 찾지 못했습니다.'}, status_code=404)
+            if action == 'run':
+                if (user, task_id) in running:
+                    return JSONResponse({'error': '지금 하고 있습니다.'}, status_code=409)
+                job = asyncio.create_task(run_task(user, task_id, datetime.now().strftime('%Y-%m-%d'), force=True))
+                background.add(job)
+                job.add_done_callback(background.discard)
+                await asyncio.sleep(0)                           # 하기 시작한 것이 아래 목록에 보이게
+            elif action == 'delete':
+                database.delete_task(user, task_id)
+            elif action in ('up', 'down'):                       # 그날 결과에 대한 반응(다음에 할 때 반영한다)
+                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(body.get('day') or '')):
+                    return JSONResponse({'error': '어느 날의 결과인지 알 수 없습니다.'}, status_code=400)
+                database.save_task(user, tasks.react(task, body['day'], action))
+            elif action == 'mail_on' and not mail_ok(user):
+                return JSONResponse({'error': '이 계정에는 메일 주소가 없습니다.'}, status_code=400)
+            else:
+                change = {'pause': {'paused': True}, 'resume': {'paused': False}, 'mail_on': {'mail': True}, 'mail_off': {'mail': False}}[action]
+                database.save_task(user, {**task, **change})
+        return JSONResponse(desk_state(user))
 
     async def search_api(request: Request) -> Response:
         session = api_guard(request, write=False)
@@ -894,7 +1185,8 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                              'refresh': _refresh_report(briefing.refresh_status)})
 
     background: set[asyncio.Task] = set()
-    routes = [Route('/api/brief', brief_api, methods=['GET', 'POST', 'PUT']), Route('/api/search', search_api), Route('/api/status', status_api), Route('/api/files', upload, methods=['POST']), Route('/api/files', file_list),
+    routes = [Route('/signup', signup_page), Route('/api/signup', signup_api, methods=['POST']), Route('/api/accounts', accounts_api, methods=['GET', 'POST']),
+              Route('/api/assistant', assistant_api, methods=['GET', 'POST']), Route('/api/search', search_api), Route('/api/status', status_api), Route('/api/files', upload, methods=['POST']), Route('/api/files', file_list),
               Route('/api/files/{file_id}', file, methods=['GET', 'DELETE']),
               Route('/api/files/{file_id}/info', file_info), Route('/api/files/{file_id}/pages/{page}', file_page),
               Route('/api/conversations/{conversation_id}/export', export), Route('/', index), Route('/static/{name}', static), Route('/login', login_page), Route('/login', login, methods=['POST']),
@@ -911,14 +1203,14 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 log.exception('MCP 서버 목록을 받지 못했습니다')
         task = asyncio.create_task(warm()) if runner is None else None
 
-        async def clockwork() -> None:               # 아침 브리핑: 30초마다 만들 때가 됐는지 본다
+        async def clockwork() -> None:               # 맡긴 일: 30초마다 할 때가 된 것이 있는지 본다
             while True:
                 try:
-                    await brief_tick()
+                    await task_tick()
                 except Exception:
-                    log.exception('브리핑 확인 중 오류')
+                    log.exception('맡긴 일 확인 중 오류')
                 await asyncio.sleep(30)
-        timer = asyncio.create_task(clockwork()) if runner is None and briefing.enabled and database is not None else None
+        timer = asyncio.create_task(clockwork()) if runner is None and desk_on else None
         yield
         for pending in (task, timer, *background):
             if pending and not pending.done():
@@ -928,7 +1220,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
 
     app = Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(SecurityHeaders),
                                                                   Middleware(TrustedHostMiddleware, allowed_hosts=list(web.allowed_hosts))])
-    app.state.brief_tick, app.state.make_brief = brief_tick, make_brief          # 시험과 수동 실행에서 직접 부를 수 있게
+    app.state.task_tick, app.state.run_task, app.state.suggest_for, app.state.today_of = task_tick, run_task, suggest_for, today_of      # 시험과 수동 실행에서 직접 부를 수 있게
     return app
 
 

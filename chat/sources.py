@@ -90,10 +90,12 @@ def _address(item: dict[str, Any]) -> str:
 
 
 class Sources:
-    """대화 하나의 출처 목록. items 는 대화에 그대로 저장된다(번호 n 은 1부터, 지워지지 않는다)."""
+    """대화 하나의 출처 목록. items 는 대화에 그대로 저장된다(번호 n 은 1부터). 보통은 지워지지 않지만, 오래 이어지는
+    비서 대화는 답이 가리키지 않는 출처를 덜어 내고(prune) 빈 번호를 다시 쓴다."""
 
-    def __init__(self, items: list[dict[str, Any]] | None = None):
+    def __init__(self, items: list[dict[str, Any]] | None = None, limit: int = MAX_SOURCES):
         self.items: list[dict[str, Any]] = items if items is not None else []
+        self.limit = limit
         self._by_url = {item['url']: item for item in self.items}
         self.fresh: list[dict[str, Any]] = []            # 이번 차례에 새로 생긴 것(화면에 바로 보낸다)
 
@@ -104,14 +106,23 @@ class Sources:
             if item and not known.get('snippet'):            # 목록에서 먼저 본 자료를 상세로 다시 보면 요약을 채운다
                 known['snippet'] = _snippet(item)
             return known['n']
-        if len(self.items) >= MAX_SOURCES:
+        if len(self.items) >= self.limit:
             return 0
-        source = {'n': len(self.items) + 1, 'url': url, 'title': ' '.join(str(title).split())[:200] or url, 'site': _site(url),
+        number = len(self.items) + 1
+        if self.items and max(item['n'] for item in self.items) != len(self.items):      # 덜어 낸 자리가 있으면 가장 작은 빈 번호를 쓴다
+            used = {item['n'] for item in self.items}
+            number = next(candidate for candidate in range(1, len(used) + 2) if candidate not in used)
+        source = {'n': number, 'url': url, 'title': ' '.join(str(title).split())[:200] or url, 'site': _site(url),
                   'facts': _facts(item or {}), 'snippet': _snippet(item or {}), 'tool': tool}
         self.items.append(source)
         self._by_url[url] = source
         self.fresh.append(source)
         return source['n']
+
+    def prune(self, keep: set[int]) -> None:
+        """keep 에 없는 번호의 출처를 덜어 낸다(목록은 그 자리에서 고친다: 대화가 같은 목록을 들고 있다)."""
+        self.items[:] = [item for item in self.items if item['n'] in keep]
+        self._by_url = {item['url']: item for item in self.items}
 
     def take_fresh(self) -> list[dict[str, Any]]:
         fresh, self.fresh = self.fresh, []

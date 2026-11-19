@@ -96,6 +96,10 @@ class FileStore:
                 found.append(meta)
         return sorted(found, key=lambda meta: -float(meta.get('created') or 0))
 
+    def purge(self, user: str) -> None:
+        """그 계정의 파일을 모두 지운다(계정을 지울 때)."""
+        shutil.rmtree(self._folder(user), ignore_errors=True)
+
     def has(self, user: str, file_id: Any) -> bool:
         return bool(re.fullmatch(r'[A-Za-z0-9_-]{8,40}', str(file_id or ''))) and (self._folder(user) / str(file_id)).is_file()
 

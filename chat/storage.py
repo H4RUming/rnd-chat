@@ -1,4 +1,4 @@
-"""대화를 파일(SQLite)에 남긴다. 서버를 다시 띄워도 대화와 그 안의 출처·작업 기록이 그대로 있다.
+"""대화를 파일(SQLite)에 남긴다. 서버를 다시 띄워도 대화와 그 안의 출처·작업 기록, 로그인 세션이 그대로 있다.
 
 대화 하나가 행 하나다(내용은 JSON 한 덩어리). 서버는 대화를 메모리에 두고 쓰다가 바뀔 때마다 그 대화만 다시 적는다.
 계정당 대화 수와 대화당 메시지 수에 상한이 있어(web.py) 통째로 읽고 써도 가볍다. 파일은 서버를 돌리는 계정만 읽을 수 있게 둔다.
@@ -35,6 +35,28 @@ CREATE TABLE IF NOT EXISTS briefs (         -- 아침 브리핑: 계정마다 �
     attempts INTEGER NOT NULL DEFAULT 0,
     updated REAL NOT NULL,
     PRIMARY KEY (user, day)
+);
+CREATE TABLE IF NOT EXISTS sessions (       -- 로그인 세션. key 는 쿠키 토큰의 해시다(토큰 자체는 적지 않는다)
+    key TEXT PRIMARY KEY,
+    user TEXT NOT NULL,
+    created REAL NOT NULL,
+    seen REAL NOT NULL,
+    stamp TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS accounts (       -- 회원가입 신청(pending)과, 관리자가 승인해 등록된 계정(active)
+    name TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created REAL NOT NULL,
+    decided REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tasks (          -- 비서에게 맡긴 일(일 하나가 행 하나, 내용은 JSON)
+    user TEXT NOT NULL,
+    id TEXT NOT NULL,
+    created REAL NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (user, id)
 );
 '''
 
@@ -115,6 +137,80 @@ class Database:
             'INSERT OR REPLACE INTO briefs (user, day, status, conversation_id, mailed, note, attempts, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             (user, day, status, conversation_id or previous.get('conversation_id', ''), mailed or previous.get('mailed', ''), note[:500],
              int(previous.get('attempts', 0)) + (1 if attempt else 0), now))
+        self._connection.commit()
+
+    def sessions(self) -> list[tuple[str, str, float, float, str]]:
+        return [tuple(row) for row in self._connection.execute('SELECT key, user, created, seen, stamp FROM sessions')]
+
+    def save_session(self, key: str, user: str, created: float, seen: float, stamp: str) -> None:
+        self._connection.execute('INSERT OR REPLACE INTO sessions (key, user, created, seen, stamp) VALUES (?, ?, ?, ?, ?)', (key, user, created, seen, stamp))
+        self._connection.commit()
+
+    def touch_session(self, key: str, seen: float) -> None:
+        self._connection.execute('UPDATE sessions SET seen = ? WHERE key = ?', (seen, key))
+        self._connection.commit()
+
+    def delete_session(self, key: str) -> None:
+        self._connection.execute('DELETE FROM sessions WHERE key = ?', (key,))
+        self._connection.commit()
+
+    def tasks(self, user: str = '') -> dict[str, list[dict[str, Any]]] | list[dict[str, Any]]:
+        """맡긴 일(맡긴 순서). user 를 주면 그 계정의 목록, 비우면 계정별 목록."""
+        found: dict[str, list[dict[str, Any]]] = {}
+        for owner, task_id, data in self._connection.execute('SELECT user, id, data FROM tasks WHERE user = ? OR ? = \'\' ORDER BY created, id', (user, user)):
+            try:
+                task = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(task, dict) and task.get('id') == task_id:
+                found.setdefault(owner, []).append(task)
+        return found.get(user, []) if user else found
+
+    def save_task(self, user: str, task: dict[str, Any]) -> None:
+        self._connection.execute('INSERT OR REPLACE INTO tasks (user, id, created, data) VALUES (?, ?, ?, ?)',
+                                 (user, task['id'], float(task.get('created') or 0.0), json.dumps(task, ensure_ascii=False, separators=(',', ':'))))
+        self._connection.commit()
+
+    def delete_task(self, user: str, task_id: str) -> None:
+        self._connection.execute('DELETE FROM tasks WHERE user = ? AND id = ?', (user, task_id))
+        self._connection.commit()
+
+    def profiles(self) -> dict[str, dict[str, Any]]:
+        found = {}
+        for user, data in self._connection.execute('SELECT user, data FROM profiles'):
+            try:
+                found[user] = json.loads(data)
+            except ValueError:
+                continue
+        return {user: data for user, data in found.items() if isinstance(data, dict)}
+
+    _ACCOUNT = ('name', 'email', 'password_hash', 'status', 'created', 'decided')
+
+    def accounts(self, status: str = '') -> list[dict[str, Any]]:
+        """가입 신청과 등록된 계정(신청한 순서). status 를 주면 그 상태만."""
+        rows = self._connection.execute('SELECT name, email, password_hash, status, created, decided FROM accounts WHERE status = ? OR ? = \'\' '
+                                        'ORDER BY created, name', (status, status)).fetchall()
+        return [dict(zip(self._ACCOUNT, row)) for row in rows]
+
+    def add_account(self, name: str, email: str, password_hash: str, now: float) -> None:
+        self._connection.execute("INSERT INTO accounts (name, email, password_hash, status, created) VALUES (?, ?, ?, 'pending', ?)",
+                                 (name, email, password_hash, now))
+        self._connection.commit()
+
+    def activate_account(self, name: str, now: float) -> bool:
+        done = self._connection.execute("UPDATE accounts SET status = 'active', decided = ? WHERE name = ? AND status = 'pending'", (now, name)).rowcount
+        self._connection.commit()
+        return bool(done)
+
+    def delete_account(self, name: str) -> bool:
+        done = self._connection.execute('DELETE FROM accounts WHERE name = ?', (name,)).rowcount
+        self._connection.commit()
+        return bool(done)
+
+    def forget(self, user: str) -> None:
+        """그 계정이 남긴 것(대화, 관심사, 브리핑 기록, 로그인, 맡긴 일)을 모두 지운다. 같은 이름으로 다시 가입한 사람이 물려받지 않게."""
+        for table in ('conversations', 'profiles', 'briefs', 'sessions', 'tasks'):
+            self._connection.execute(f'DELETE FROM {table} WHERE user = ?', (user,))
         self._connection.commit()
 
     def close(self) -> None:

@@ -117,13 +117,14 @@ def _change(entry: dict[str, Any]) -> dict[str, Any]:
 class LocalTools:
     """한 사용자의 한 요청에 묶인 도구 모음."""
 
-    def __init__(self, store: FileStore, user: str, previews: Previews | None = None, sources: Sources | None = None):
+    def __init__(self, store: FileStore, user: str, previews: Previews | None = None, sources: Sources | None = None, extra: Any = None):
         self.store, self.user = store, user
         self.previews = previews or Previews(store)
         self.sources = sources or Sources()
+        self.extra = extra                               # 이 대화에서만 더 주는 도구(비서 대화의 맡긴 일 도구). specs() 와 call() 이 있다
 
     def specs(self) -> list[dict[str, Any]]:
-        return SPECS
+        return SPECS + (self.extra.specs() if self.extra else [])
 
     def observe(self, name: str, arguments: dict[str, Any], text: str, is_error: bool) -> tuple[str, dict[str, Any]]:
         """자료 서버의 결과에서 출처를 등록한다. (번호를 넣은 결과 글, 화면용 요약)"""
@@ -132,7 +133,7 @@ class LocalTools:
     async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult | None:
         """우리 도구가 아니면 None(그러면 MCP 쪽에서 찾는다)."""
         if name not in NAMES:
-            return None
+            return await self.extra.call(name, arguments) if self.extra else None
         arguments = dict(arguments)
         for key in ('blocks', 'edits', 'sheets', 'pages'):   # 모델이 목록을 JSON 글로 감싸 보내는 일이 있다: 풀어서 받는다
             if isinstance(arguments.get(key), str):
