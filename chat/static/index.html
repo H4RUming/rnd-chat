@@ -5,17 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>R&amp;D 검색</title>
 <script src="/static/theme.js"></script>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/base.css">
+<link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="app empty">
 <svg class="sprite" aria-hidden="true">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path d="M7 20V4.500h6.500a4 4 0 0 1 0 8H7M12.500 12.500 17.500 20"/><circle class="logo-node" cx="7" cy="20" r="2.300"/><circle class="logo-spark" cx="17.500" cy="20" r="2.700"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
-  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/></symbol>
   <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
   <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></symbol>
-  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none"/></symbol>
-  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 0 1 7.5 4H15"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6.5A2.5 2.5 0 0 1 7.5 4H15"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.4 5.7"/><path d="M20 4.5V11h-6.5"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l.9 11.2a2 2 0 0 0 2 1.8h5.2a2 2 0 0 0 2-1.8L17.5 7M10 11v5.5M14 11v5.5"/></symbol>
@@ -25,23 +27,36 @@
   <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></symbol>
   <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9.5 20.5H6a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2h3.5M15.5 16.5 20 12l-4.5-4.5M20 12H9.5"/></symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></symbol>
   <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.3v.2"/></symbol>
-  <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3.5 13.9 9l5.6 2-5.6 2L12 18.5 10.1 13l-5.6-2 5.6-2z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 24 24"><path d="m20 11.5-8.2 8.2a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.4 8.4a1.7 1.7 0 0 1-2.4-2.4l7.7-7.7"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3.5H7.5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8zM14 3.5V8h4.5M9 13h6M9 16.5h6"/></symbol>
+  <symbol id="i-sheet" viewBox="0 0 24 24"><rect x="4" y="4.5" width="16" height="15" rx="2"/><path d="M4 9.5h16M4 14.5h16M10 4.5v15"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="m6.5 6.5 11 11M17.5 6.5l-11 11"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+  <symbol id="i-out" viewBox="0 0 24 24"><path d="M8 16 18 6M10 6h8v8"/></symbol>
+  <symbol id="i-compare" viewBox="0 0 24 24"><rect x="3.5" y="5" width="7" height="14" rx="1.5"/><rect x="13.500" y="5" width="7" height="14" rx="1.500" stroke-dasharray="2.500 2.500"/></symbol>
+  <symbol id="i-megaphone" viewBox="0 0 24 24"><path d="M4 10v4a1 1 0 0 0 1 1h2.5l7.500 4V5L7.500 9H5a1 1 0 0 0-1 1zM18 9.500a4 4 0 0 1 0 5M8 15v3.500a1.500 1.500 0 0 0 3 0V16.800"/></symbol>
+  <symbol id="i-trend" viewBox="0 0 24 24"><path d="M4 19.500h16M5.500 15.500l4.500-5 3.500 3 5-6.500M14.500 7h4v4"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9.500 3.500h5M10.500 3.500v5.800L5 18.300a1.500 1.500 0 0 0 1.300 2.200h11.400a1.500 1.500 0 0 0 1.300-2.200l-5.500-9V3.500M8 14.500h8"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 7h11M9 12h11M9 17h11M4.500 7h.010M4.500 12h.010M4.500 17h.010"/></symbol>
 </svg>
 
 <div id="backdrop"></div>
 
 <aside id="sidebar" aria-label="대화">
   <div class="side-head">
-    <a class="brand" href="/"><span class="mark" aria-hidden="true"><svg><use href="#i-spark"/></svg></span><span>R&amp;D 검색</span></a>
+    <a class="brand" href="/"><svg class="logo" aria-hidden="true"><use href="#i-logo"/></svg><span>R&amp;D 검색</span></a>
     <button id="collapse" class="icon" type="button" aria-label="사이드바 닫기" title="사이드바 닫기"><svg><use href="#i-panel"/></svg></button>
   </div>
-  <button id="new" class="new" type="button"><svg><use href="#i-plus"/></svg><span>새 대화</span></button>
-  <label class="search"><svg><use href="#i-search"/></svg><input id="filter" type="search" placeholder="대화 찾기" aria-label="대화 찾기" autocomplete="off"></label>
+  <button id="new" class="new" type="button" title="새 대화 (Ctrl Shift O)"><svg><use href="#i-plus"/></svg><span>새 대화</span></button>
+  <label class="search"><svg><use href="#i-search"/></svg><input id="filter" type="search" aria-label="대화 찾기" title="대화 찾기" autocomplete="off"></label>
   <nav id="list" aria-label="대화 목록"></nav>
   <div class="side-foot">
     <div id="usermenu" class="menu up" role="menu" hidden>
-      <button id="theme" type="button" role="menuitem"><svg><use id="themeicon" href="#i-monitor"/></svg><span id="themelabel">테마: 시스템 설정</span></button>
+      <button id="theme" type="button" role="menuitem"><svg><use id="themeicon" href="#i-monitor"/></svg><span id="themelabel">화면: 시스템 설정</span></button>
       <form method="post" action="/logout"><button type="submit" role="menuitem"><svg><use href="#i-logout"/></svg><span>로그아웃</span></button></form>
     </div>
     <button id="user" class="user" type="button" aria-haspopup="menu" aria-expanded="false">
@@ -69,28 +84,45 @@
   <button id="tobottom" class="icon float" type="button" aria-label="맨 아래로" hidden><svg><use href="#i-down"/></svg></button>
 
   <div id="dock">
-    <div id="landing">
-      <span class="mark big" aria-hidden="true"><svg><use href="#i-spark"/></svg></span>
-      <h2 id="greeting">무엇을 찾아 드릴까요?</h2>
-      <p>지원사업 공고와 국가R&amp;D 과제를 직접 찾아 근거와 함께 답합니다.</p>
-    </div>
+    <div id="landing" aria-hidden="true"><svg class="logo" aria-hidden="true"><use href="#i-logo"/></svg></div>
     <form id="composer">
+      <div id="attachments" aria-live="polite"></div>
       <textarea id="input" rows="1" placeholder="무엇이든 물어보세요" aria-label="질문"></textarea>
       <div class="composer-foot">
-        <span class="hint">Enter 전송 · Shift+Enter 줄바꿈</span>
+        <button id="attach" class="icon" type="button" aria-label="문서 첨부 (HWP, HWPX, DOCX, PDF)" title="문서 첨부 (HWP, HWPX, DOCX, PDF)"><svg><use href="#i-plus"/></svg></button>
+        <input id="file" type="file" accept=".pdf,.hwp,.hwpx,.docx,application/pdf" hidden>
+        <span class="spacer"></span>
         <span id="counter" hidden></span>
-        <button id="send" class="send" type="submit" aria-label="보내기" title="보내기" disabled><svg><use id="sendicon" href="#i-up"/></svg></button>
+        <button id="send" class="send" type="submit" aria-label="보내기" title="보내기 (Enter)" disabled><svg><use id="sendicon" href="#i-up"/></svg></button>
       </div>
     </form>
     <div id="suggestions">
-      <button type="button" data-q="강원도 중소기업이 지금 신청할 수 있는 AI 관련 지원사업을 마감일과 함께 알려줘"><strong>지금 신청할 수 있는 공고</strong><span>강원도 중소기업 대상 AI 지원사업</span></button>
-      <button type="button" data-q="최근 3년 기술 분야 지원사업 공고 수를 연도별·부처별로 표로 정리해줘"><strong>공고 추이 취합</strong><span>최근 3년 기술 분야, 연도·부처별</span></button>
-      <button type="button" data-q="인공지능 반도체 국가R&amp;D 과제가 최근 3년 연도별로 몇 건인지, 어느 부처가 많이 지원했는지 알려줘"><strong>국가R&amp;D 과제 현황</strong><span>인공지능 반도체, 연도·부처별</span></button>
-      <button type="button" data-q="양자컴퓨팅 분야에서 최근 지원된 국가R&amp;D 과제 5개를 수행기관·연구비와 함께 정리해줘"><strong>과제 찾아보기</strong><span>양자컴퓨팅 분야 최근 과제</span></button>
+      <button type="button" data-q="강원도 중소기업이 신청할 수 있는 AI 지원사업과 마감일 알려줘"><svg aria-hidden="true"><use href="#i-megaphone"/></svg><strong>지금 신청할 수 있는 지원사업</strong></button>
+      <button type="button" data-q="최근 3년 기술 분야 공고 수를 연도별·부처별 표로 정리해줘"><svg aria-hidden="true"><use href="#i-trend"/></svg><strong>공고가 늘었는지 줄었는지</strong></button>
+      <button type="button" data-q="인공지능 반도체 국가R&amp;D 과제의 최근 3년 연도별·부처별 건수 알려줘"><svg aria-hidden="true"><use href="#i-flask"/></svg><strong>국가R&amp;D 과제 현황</strong></button>
+      <button type="button" data-action="attach"><svg aria-hidden="true"><use href="#i-clip"/></svg><strong>신청서 양식 채우기</strong></button>
     </div>
-    <p class="disclaimer">모델이 자료를 찾아 정리한 답입니다. 중요한 내용은 원문에서 확인하세요.</p>
   </div>
 </main>
+
+<div id="drop" hidden><div><svg><use href="#i-download"/></svg><span>HWP · HWPX · DOCX · PDF</span></div></div>
+<div id="sourcecard" role="tooltip" hidden></div>
+
+<dialog id="viewer" aria-label="문서 미리보기">
+  <header class="viewer-head">
+    <div class="viewer-title"><strong id="viewername"></strong><span id="viewerinfo"></span></div>
+    <span class="spacer"></span>
+    <div id="viewerpager" class="pager"><button id="viewerprev" class="icon" type="button" aria-label="앞 쪽" title="앞 쪽"><svg><use href="#i-left"/></svg></button><span id="viewerpage">1 / 1</span><button id="viewernext" class="icon" type="button" aria-label="다음 쪽" title="다음 쪽"><svg><use href="#i-right"/></svg></button></div>
+    <button id="viewercompare" class="pill" type="button" aria-pressed="false" hidden><svg><use href="#i-compare"/></svg><span>원본 보기</span></button>
+    <button id="viewerchanges" class="pill" type="button" aria-pressed="true" hidden><svg><use href="#i-list"/></svg><span>바뀐 내용</span></button>
+    <a id="viewerdownload" class="pill solid" href="#" download><svg><use href="#i-download"/></svg><span>내려받기</span></a>
+    <button id="viewerclose" class="icon" type="button" aria-label="닫기" title="닫기 (Esc)"><svg><use href="#i-x"/></svg></button>
+  </header>
+  <div class="viewer-body">
+    <div id="viewerpages" class="pages" tabindex="0"></div>
+    <aside id="viewerside" class="changes" hidden></aside>
+  </div>
+</dialog>
 <script src="/static/app.js"></script>
 </body>
 </html>

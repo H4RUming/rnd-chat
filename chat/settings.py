@@ -1,4 +1,4 @@
-"""설정 파일의 [llm], [agent], [[mcp]] 를 읽어 값의 범위를 확인한다."""
+"""설정 파일의 [llm], [agent], [web], [documents], [[mcp]], [[users]] 를 읽어 값의 범위를 확인한다."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,6 +17,7 @@ class Llm:
     api_key: str = ''
     temperature: float = 0.3
     max_tokens: int = 4096
+    thinking: str = ''                   # 'on' | 'off' | ''(모델 기본). 생각하는 모델이 답하기 전에 따져 보게 할지
     timeout: float = 300.0
 
 
@@ -53,6 +54,8 @@ class Settings:
     servers: tuple[McpServer, ...]
     web: Web = Web()
     users: tuple[dict[str, Any], ...] = ()
+    data_dir: str = ''                   # 올린 파일·만든 파일을 두는 곳(설정 파일 옆의 data/)
+    rhwp: str = ''                       # 한글 문서 엔진(rhwp) 실행 파일. 비워 두면 PATH 에서 찾는다
 
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> 'Settings':
@@ -77,7 +80,8 @@ class Settings:
         return cls(
             llm=Llm(base_url=base_url, model=str(llm['model']).strip(), api_key=str(llm.get('api_key') or '').strip(),
                     temperature=_number(llm, 'temperature', 0.3, 0.0, 2.0), max_tokens=int(_number(llm, 'max_tokens', 4096, 64, 65536)),
-                    timeout=_number(llm, 'timeout', 300.0, 5.0, 3600.0)),
+                    timeout=_number(llm, 'timeout', 300.0, 5.0, 3600.0),
+                    thinking={True: 'on', False: 'off'}[_flag(llm, 'thinking', True)] if 'thinking' in llm else ''),
             agent=Agent(max_steps=int(_number(agent, 'max_steps', 12, 1, 50)),
                         tool_result_chars=int(_number(agent, 'tool_result_chars', 24000, 1000, 400000)),
                         max_images=int(_number(agent, 'max_images', 4, 0, 16))),
@@ -88,7 +92,9 @@ class Settings:
                     max_question_chars=int(_number(web, 'max_question_chars', 4000, 100, 100000)),
                     trust_forwarded=_flag(web, 'trust_forwarded', False), allowed_hosts=_hosts(web),
                     **_tls(web, appconfig.config_path(path).parent)),
-            users=tuple(entry for entry in config.get('users', []) if isinstance(entry, dict)))
+            users=tuple(entry for entry in config.get('users', []) if isinstance(entry, dict)),
+            data_dir=str(appconfig.config_path(path).parent / 'data'),
+            rhwp=_program(_table(config, 'documents'), 'rhwp', appconfig.config_path(path).parent))
 
 
 def _table(config: dict[str, Any], name: str) -> dict[str, Any]:
@@ -113,6 +119,18 @@ def _tls(web: dict[str, Any], base: Path) -> dict[str, str]:
             raise ValueError(f'설정 [web] {name} 파일이 없습니다: {path}')
         found[name] = str(path)
     return found
+
+
+def _program(table: dict[str, Any], name: str, base: Path) -> str:
+    """[documents] 의 실행 파일 경로. 상대 경로는 설정 파일이 있는 폴더 기준이고, 적었으면 실제로 있어야 한다."""
+    value = str(table.get(name) or '').strip()
+    if not value:
+        return ''
+    path = Path(value).expanduser()
+    path = path if path.is_absolute() else base / path
+    if not (path.is_file() and os.access(path, os.X_OK)):
+        raise ValueError(f'설정 [documents] {name} 이 실행 파일이 아닙니다: {path}')
+    return str(path)
 
 
 def _hosts(web: dict[str, Any]) -> tuple[str, ...]:

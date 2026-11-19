@@ -5,14 +5,24 @@ const API_HEADERS = {'Content-Type': 'application/json', 'X-Requested-With': 'rn
 const SVG = 'http://www.w3.org/2000/svg';
 const $ = (id) => document.getElementById(id);
 const root = document.documentElement;
-const state = {conversation: null, conversations: [], busy: false, controller: null, limit: 4000, name: ''};
+const state = {conversation: null, conversations: [], busy: false, controller: null, limit: 4000, name: '', attachments: [], uploading: 0,
+               sources: new Map()};          // sources: 이 대화에서 도구가 찾은 자료(번호 → 자료). 답의 [번호] 가 가리킨다.
+const KIND = {pdf: 'PDF', docx: '워드 문서', xlsx: '엑셀', hwp: '한글 문서', hwpx: '한글 문서'};
+const hasTable = (text) => /\|[^\n]*\n\s*\|?\s*:?-{2,}/.test(text || '');
 const TOOLS = {
   search: '공고 검색', fetch: '공고 본문 읽기', search_notices: '진행 중 공고 검색', get_notice: '공고 상세 확인', read_document: '첨부 문서 읽기',
   open_link: '링크 열기', view_link: '링크 화면 보기', search_history: '공고 이력 검색', count_history: '공고 이력 집계',
   get_history_notice: '이력 공고 상세 확인', read_history_document: '이력 첨부 읽기', view_history_document: '이력 첨부 보기',
   history_status: '이력 자료 범위 확인', search_projects: 'NTIS 과제 검색', count_projects: 'NTIS 과제 집계', get_project: 'NTIS 과제 상세 확인',
   search_results: 'NTIS 성과 검색', count_results: 'NTIS 성과 집계', search_reports: 'NTIS 연구보고서 검색', lookup_term: 'NTIS 용어사전 조회',
-  lookup_class_code: 'NTIS 분류코드 조회', ntis_status: 'NTIS 연결 확인',
+  lookup_class_code: 'NTIS 분류코드 조회', ntis_status: 'NTIS 연결 확인', create_document: '워드 문서 만들기', create_spreadsheet: '엑셀 파일 만들기',
+  edit_document: '문서 고치기', inspect_document: '문서 들여다보기',
+};
+const ARGS = {
+  query: '검색어', query_text: '검색어', limit: '개수', offset: '건너뛰기', year_from: '시작 연도', year_to: '끝 연도', ministry: '부처', organization: '기관',
+  region: '지역', category: '분야', group_by: '묶는 기준', notice_id: '공고 번호', project_number: '과제 번호', url: '주소', kind: '종류', file_id: '파일',
+  filename: '파일 이름', edits: '고칠 곳', sheets: '시트', blocks: '내용', markdown: '내용', status: '상태', sort: '정렬', search_in: '찾는 범위', table: '표',
+  pages: '쪽', title: '제목', from_paragraph: '시작 문단', attachment_id: '첨부', publisher: '발행처', program: '사업', id: '번호', agency: '소관',
 };
 
 function el(tag, props, ...children) {
@@ -36,6 +46,12 @@ function iconButton(name, label, handler) {
   const button = el('button', {type: 'button', class: 'icon', 'aria-label': label, title: label}, icon(name));
   button.addEventListener('click', handler);
   return button;
+}
+
+function seal() {
+  const mark = icon('logo');
+  mark.classList.add('logo');
+  return mark;
 }
 
 async function api(path, options) {
@@ -76,14 +92,15 @@ function link(text, url) {
 }
 
 const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[[^\]\n]+\]\((?:[^()\s]|\([^()\s]*\))+\))|(https?:\/\/[^\s<>()"']+[^\s<>()"'.,;:!?])/g;
+const CITE = /((?:\[\d{1,3}(?:\s*,\s*\d{1,3})*\])+)(?!\()/g;       // [3] · [3][5] · [3, 5]  (마크다운 링크 [글](주소) 는 아니다)
 
-function inline(parent, text) {
+function plain(parent, text) {
   let last = 0;
   for (const match of text.matchAll(INLINE)) {
     if (match.index > last) parent.append(text.slice(last, match.index));
     const token = match[0];
     if (match[1]) parent.append(el('code', {text: token.slice(1, -1)}));
-    else if (match[2]) parent.append(inline(el('strong'), token.slice(2, -2)));
+    else if (match[2]) parent.append(plain(el('strong'), token.slice(2, -2)));
     else if (match[3]) { const cut = token.indexOf(']('); parent.append(link(token.slice(1, cut), token.slice(cut + 2, -1))); }
     else parent.append(link(token, token));
     last = match.index + token.length;
@@ -92,11 +109,63 @@ function inline(parent, text) {
   return parent;
 }
 
+function sentenceStart(text) {
+  // 형광펜을 시작할 자리: 번호 바로 앞 문장의 처음. 굵은 글·링크 한가운데나 날짜("2026. 12. 17.")에서는 끊지 않는다.
+  const spans = [...text.matchAll(INLINE)].map((match) => [match.index, match.index + match[0].length]);
+  let start = 0;
+  for (const match of text.matchAll(/[.!?](\s+)(?=\S)/g)) {
+    const at = match.index;
+    if (text[at] === '.' && /\d/.test(text[at - 1] || '')) continue;
+    if (spans.some(([from, to]) => at >= from && at < to)) continue;
+    start = at + 1 + match[1].length;
+  }
+  return start;
+}
+
+// 도구가 매긴 번호는 대화 전체에서 이어지므로 크고 들쭉날쭉하다. 화면에는 답마다 처음 나온 순서대로 1, 2, 3 … 으로 보여 준다.
+let shownAs = new Map();
+const shown = (number) => String(shownAs.get(number) || number);
+
+function citedNumbers(text) {                               // 답에서 가리킨 자료 번호(처음 나온 순서)
+  const numbers = [];
+  for (const match of (text || '').matchAll(CITE)) {
+    for (const digits of match[1].match(/\d+/g)) if (state.sources.has(Number(digits)) && !numbers.includes(Number(digits))) numbers.push(Number(digits));
+  }
+  return numbers;
+}
+
+function refChip(number) {
+  const source = state.sources.get(number);
+  return el('a', {class: 'ref', href: safeUrl(source.url) || '#', target: '_blank', rel: 'noopener noreferrer', 'data-n': String(number), text: shown(number),
+                  'aria-label': `출처 ${shown(number)}: ${source.title}`});
+}
+
+function inline(parent, text) {
+  // 출처 번호가 붙은 문장은 형광펜으로 칠하고 번호를 단다. 모르는 번호는 글 그대로 둔다.
+  let last = 0;
+  for (const match of text.matchAll(CITE)) {
+    const numbers = [...new Set(match[1].match(/\d+/g).map(Number))].filter((number) => state.sources.has(number));
+    if (!numbers.length) continue;
+    const segment = text.slice(last, match.index), cut = sentenceStart(segment);
+    plain(parent, segment.slice(0, cut));
+    const marked = segment.slice(cut).replace(/\s+$/, '');
+    if (marked.trim()) parent.append(plain(el('span', {class: 'hl', tabindex: '0', role: 'link', 'data-n': numbers.join(' ')}), marked));
+    for (const number of numbers) parent.append(refChip(number));
+    last = match.index + match[0].length;
+  }
+  plain(parent, text.slice(last));
+  return parent;
+}
+
 const cells = (line) => line.trim().replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim());
 const isRule = (line) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
 const LIST = /^\s*([-*•]|\d+[.)])\s+/;
 
+// 글자 폭으로 센 길이: 한글·한자는 두 칸, 나머지는 한 칸(화면 글꼴이 고정폭이라 칸 수가 곧 너비다).
+const columns = (text) => { let n = 0; for (const ch of text) n += ch.codePointAt(0) >= 0x1100 ? 2 : 1; return n; };
+
 function markdown(text) {
+  shownAs = new Map(citedNumbers(text).map((number, index) => [number, index + 1]));
   const fragment = document.createDocumentFragment();
   const lines = text.replace(/\r/g, '').split('\n');
   let i = 0;
@@ -123,7 +192,7 @@ function markdown(text) {
       const body = el('tbody');
       for (i += 2; i < lines.length && lines[i].includes('|') && lines[i].trim(); i++) {
         const row = el('tr');
-        for (const cell of cells(lines[i])) row.append(inline(el('td'), cell));
+        for (const cell of cells(lines[i])) row.append(inline(el('td', columns(cell) <= 26 ? {class: 'tight'} : null), cell));   // 짧은 칸(날짜·금액)은 줄을 바꾸지 않는다
         body.append(row);
       }
       fragment.append(el('div', {class: 'table'}, el('table', null, el('thead', null, head), body)));
@@ -164,6 +233,108 @@ function markdown(text) {
   return fragment;
 }
 
+// ── 출처 카드(형광펜에 마우스를 올리면 뜬다) ───────────────────────────
+const card = {timer: 0, number: null, scope: null};
+
+function light(scope, number, on) {
+  if (!scope) return;
+  for (const node of scope.querySelectorAll('[data-n]')) if (node.dataset.n.split(' ').includes(String(number))) node.classList.toggle('on', on);
+}
+
+function showCard(anchor, number, x, y) {
+  const source = state.sources.get(number), box = $('sourcecard');
+  if (!source) return;
+  const label = (anchor.closest('.msg') && anchor.closest('.msg').querySelector(`.ref[data-n="${number}"]`) || {}).textContent || '';
+  clearTimeout(card.timer);
+  if (card.number !== null) light(card.scope, card.number, false);
+  card.number = number;
+  card.scope = anchor.closest('.msg');
+  light(card.scope, number, true);
+  const facts = el('dl', {class: 'card-facts'});
+  for (const [label, value] of source.facts || []) facts.append(el('dt', {text: label}), el('dd', {text: value, title: value}));
+  const href = safeUrl(source.url) || '#';
+  box.replaceChildren(...[                                 // 없는 부분(null)은 걸러 낸다 — 그대로 넘기면 'null' 이라는 글자로 찍힌다
+    el('div', {class: 'card-top'}, el('span', {text: source.site || '자료'}), label ? el('span', {class: 'ref', text: label}) : null),
+    el('div', {class: 'card-title', text: source.title}),
+    (source.facts || []).length ? facts : null,
+    source.snippet ? el('p', {class: 'card-snippet', text: source.snippet}) : null,
+    el('a', {class: 'card-open', href, target: '_blank', rel: 'noopener noreferrer'}, el('span', {text: href.replace(/^https?:\/\//, '')}), el('span', {text: '새 탭에서 열기'}), icon('out'))].filter(Boolean));
+  box.hidden = false;
+  // 가리킨 줄 바로 아래(자리가 없으면 위)에, 화면 밖으로 나가지 않게 놓는다
+  const rects = [...anchor.getClientRects()];
+  const rect = rects.find((item) => y >= item.top - 2 && y <= item.bottom + 2) || rects[0] || anchor.getBoundingClientRect();
+  const width = box.offsetWidth, height = box.offsetHeight, margin = 12;
+  const left = Math.max(margin, Math.min((x === undefined ? rect.left : x) - 36, innerWidth - width - margin));
+  let top = rect.bottom + 8;
+  if (top + height > innerHeight - margin) top = Math.max(margin, rect.top - height - 8);
+  box.style.left = left + 'px';
+  box.style.top = top + 'px';
+}
+
+function hideCard(now) {
+  clearTimeout(card.timer);
+  card.timer = setTimeout(() => {
+    $('sourcecard').hidden = true;
+    if (card.number !== null) light(card.scope, card.number, false);
+    card.number = null;
+  }, now ? 0 : 180);
+}
+
+function citeTarget(event) {
+  const node = event.target.closest ? event.target.closest('[data-n]') : null;
+  return node && node.closest('#thread') ? node : null;
+}
+
+function bindCitations() {
+  const thread = $('thread'), box = $('sourcecard');
+  thread.addEventListener('pointerover', (event) => {
+    const node = citeTarget(event);
+    if (node && event.pointerType !== 'touch') showCard(node, Number(node.dataset.n.split(' ')[0]), event.clientX, event.clientY);
+  });
+  thread.addEventListener('pointerout', (event) => { if (citeTarget(event)) hideCard(); });
+  thread.addEventListener('focusin', (event) => { const node = citeTarget(event); if (node) showCard(node, Number(node.dataset.n.split(' ')[0])); });
+  thread.addEventListener('focusout', (event) => { if (citeTarget(event)) hideCard(); });
+  thread.addEventListener('click', (event) => {
+    const node = citeTarget(event);
+    if (!node || !node.classList.contains('hl') || event.target.closest('a')) return;
+    const number = Number(node.dataset.n.split(' ')[0]), source = state.sources.get(number);
+    if (matchMedia('(hover: none)').matches && card.number !== number) return showCard(node, number, event.clientX, event.clientY);   // 터치 화면: 먼저 카드를 보여 준다
+    const href = source && safeUrl(source.url);
+    if (href) window.open(href, '_blank', 'noopener,noreferrer');
+  });
+  thread.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || !event.target.classList || !event.target.classList.contains('hl')) return;
+    const source = state.sources.get(Number(event.target.dataset.n.split(' ')[0])), href = source && safeUrl(source.url);
+    if (href) window.open(href, '_blank', 'noopener,noreferrer');
+  });
+  box.addEventListener('pointerenter', () => clearTimeout(card.timer));
+  box.addEventListener('pointerleave', () => hideCard());
+  $('scroll').addEventListener('scroll', () => { if (!box.hidden) hideCard(true); }, {passive: true});
+  document.addEventListener('pointerdown', (event) => { if (!box.hidden && !box.contains(event.target) && !citeTarget(event)) hideCard(true); });
+}
+
+function renderSources(view) {
+  const numbers = citedNumbers(view.text);
+  shownAs = new Map(numbers.map((number, index) => [number, index + 1]));
+  if (view.sourceBox) view.sourceBox.remove();
+  view.sourceBox = null;
+  if (!numbers.length) return;
+  const LIMIT = 5, box = el('div', {class: 'sources'}, el('span', {class: 'sources-label', text: `출처 ${numbers.length}`}));
+  const chip = (number) => {
+    const source = state.sources.get(number);
+    return el('a', {class: 'source', href: safeUrl(source.url) || '#', target: '_blank', rel: 'noopener noreferrer', 'data-n': String(number)},
+              el('span', {class: 'ref', text: shown(number)}), el('span', {text: source.title}));
+  };
+  for (const number of numbers.slice(0, LIMIT)) box.append(chip(number));
+  if (numbers.length > LIMIT) {
+    const more = el('button', {type: 'button', class: 'more', text: `외 ${numbers.length - LIMIT}건`});
+    more.addEventListener('click', () => more.replaceWith(...numbers.slice(LIMIT).map(chip)));
+    box.append(more);
+  }
+  view.sourceBox = box;
+  view.files.before(box);
+}
+
 // ── 대화 목록 ───────────────────────────────────────────────────────────
 function groupOf(updated) {
   const day = 86400000, start = new Date(); start.setHours(0, 0, 0, 0);
@@ -186,7 +357,7 @@ function renderList() {
     list.append(conversationRow(item));
     shown++;
   }
-  if (!shown) list.append(el('p', {class: 'none', text: words ? '찾는 대화가 없습니다.' : '아직 대화가 없습니다.'}));
+  if (!shown && words) list.append(el('p', {class: 'none', text: '찾는 대화가 없습니다.'}));
 }
 
 function conversationRow(item) {
@@ -247,29 +418,91 @@ function scrollDown(force) {
 function clearThread() {
   $('thread').replaceChildren();
   document.body.classList.add('empty');
+  hideCard(true);
 }
 
-function addUser(text) {
+function size(bytes) {
+  return bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + 'MB' : Math.max(1, Math.round(bytes / 1024)) + 'KB';
+}
+
+const fileUrl = (file, rest) => '/api/files/' + encodeURIComponent(file.id) + (rest || '');
+
+function thumbnail(file, name) {                            // 첫 쪽 그림. 못 그리면 아이콘으로 남는다.
+  const image = el('img', {class: name || '', src: fileUrl(file, '/pages/1?size=thumb'), alt: '', loading: 'lazy'});
+  image.addEventListener('error', () => image.replaceWith(icon(file.kind === 'xlsx' ? 'sheet' : 'file')));
+  return image;
+}
+
+function fileCard(file) {                                   // 올린 문서, 모델이 고치거나 만든 파일
+  const view = el('button', {type: 'button', class: 'thumb', 'aria-label': `${file.name} 미리보기`, title: '미리보기'},
+                  thumbnail(file), el('span', {class: 'kind', text: file.kind.toUpperCase()}));
+  view.addEventListener('click', () => openViewer(file));
+  const detail = [KIND[file.kind] || file.kind, file.pages ? `${file.pages}쪽` : '', size(file.size)].filter(Boolean).join(' · ');
+  const main = el('div', {class: 'file-main'}, el('strong', {text: file.name, title: file.name}), el('span', {class: 'file-detail', text: detail}));
+  if (file.origin === 'edited') {
+    main.append(el('span', {class: 'file-badge', text: `원본에 ${file.applied}곳 고침`}));
+    if (file.failed) main.append(el('span', {class: 'file-badge warn', text: `${file.failed}곳은 고치지 못함`}));
+  }
+  const preview = el('button', {type: 'button', class: 'pill'}, icon('eye'), el('span', {text: file.origin === 'edited' ? '확인하기' : '미리보기'}));
+  preview.addEventListener('click', () => openViewer(file));
+  main.append(el('div', {class: 'file-actions'}, preview,
+                 el('a', {class: 'pill', href: fileUrl(file), download: file.name}, icon('download'), el('span', {text: '내려받기'}))));
+  const node = el('div', {class: 'filecard ' + file.kind}, view, main);
+  node.dataset.id = file.id;
+  return node;
+}
+
+function addFile(view, file) {                               // 같은 문서를 다시 고친 것이면 앞의 카드를 갈아 끼운다
+  const earlier = file.previous && [...view.files.children].find((node) => node.dataset.id === file.previous);
+  if (earlier) earlier.replaceWith(fileCard(file)); else view.files.append(fileCard(file));
+}
+
+function addUser(text, files) {
   document.body.classList.remove('empty');
-  const node = el('article', {class: 'msg user'}, el('div', {class: 'bubble', text}));
+  const node = el('article', {class: 'msg user'});
+  if (files && files.length) node.append(el('div', {class: 'files'}, ...files.map(fileCard)));
+  node.append(el('div', {class: 'bubble', text}));
   $('thread').append(node);
   return node;
 }
 
-function addAssistant(text) {
+function addAssistant(message, index) {
   document.body.classList.remove('empty');
-  const body = el('div', {class: 'body'}), meta = el('span', {class: 'meta-info'}), actions = el('div', {class: 'actions'});
-  const node = el('article', {class: 'msg assistant'}, el('span', {class: 'mark', 'aria-hidden': 'true'}, icon('spark')),
-                  el('div', {class: 'content'}, el('div', {class: 'meta'}, el('strong', {text: 'R&D 검색'}), meta), body, actions));
-  const view = {node, body, meta, actions, text: text || '', steps: null, stepList: null};
-  if (text) { body.append(markdown(text)); addActions(view); }
+  message = message || {};
+  const body = el('div', {class: 'body'}), meta = el('span', {class: 'meta-info'}), actions = el('div', {class: 'actions'}), made = el('div', {class: 'files'});
+  const node = el('article', {class: 'msg assistant'}, seal(),
+                  el('div', {class: 'content'}, el('div', {class: 'meta'}, el('strong', {text: 'R&D 검색'}), meta), body, made, actions));
+  const view = {node, body, meta, actions, files: made, text: message.content || '', steps: null, stepList: null, sourceBox: null,
+                index: index === undefined ? null : index};
   $('thread').append(node);
+  for (const step of message.steps || []) { addStep(view, step); finishStep(view, step); }
+  if (message.steps && message.steps.length) finishSteps(view, false);
+  for (const file of message.files || []) made.append(fileCard(file));
+  if (message.seconds) meta.textContent = metaText(message.seconds, (message.steps || []).length);
+  if (view.text) { body.append(markdown(view.text)); renderSources(view); addActions(view); }
   return view;
 }
 
+const metaText = (seconds, steps) => `${Number(seconds).toFixed(1)}초` + (steps ? ` · 작업 ${steps}단계` : '');
+
+function exportLink(view, format, name, label) {
+  const href = `/api/conversations/${encodeURIComponent(state.conversation)}/export?index=${view.index}&format=${format}`;
+  return el('a', {class: 'icon', href, download: '', 'aria-label': label, title: label}, icon(name));
+}
+
 function addActions(view) {
-  const copy = iconButton('copy', '답 복사', () => { copyText(view.text); flash(copy, 'copy'); });
+  const copy = iconButton('copy', '답 복사', () => {
+    const numbers = citedNumbers(view.text), order = new Map(numbers.map((number, index) => [number, index + 1]));
+    const body = view.text.replace(CITE, (whole) => whole.replace(/\d+/g, (digits) => order.get(Number(digits)) || digits));   // 화면에 보이는 번호로 맞춘다
+    const cited = numbers.map((number) => `[${order.get(number)}] ${state.sources.get(number).title} — ${state.sources.get(number).url}`);
+    copyText(body + (cited.length ? '\n\n출처\n' + cited.join('\n') : ''));
+    flash(copy, 'copy');
+  });
   view.actions.replaceChildren(copy);
+  if (state.conversation && view.index !== null) {
+    view.actions.append(exportLink(view, 'docx', 'file', '워드 문서로 저장'));
+    if (hasTable(view.text)) view.actions.append(exportLink(view, 'xlsx', 'sheet', '표를 엑셀로 저장'));
+  }
   for (const old of $('thread').querySelectorAll('.regenerate')) old.remove();     // 다시 생성은 마지막 답에만
   if (state.conversation && view.node === $('thread').lastElementChild) {
     const again = iconButton('refresh', '다시 생성', () => regenerate(view));
@@ -278,29 +511,73 @@ function addActions(view) {
   }
 }
 
-function describe(args) {
-  return Object.entries(args || {}).filter(([, value]) => value !== '' && value !== 0 && value !== null && value !== false)
-    .map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join(' · ');
+// ── 작업 단계(모델이 어떤 도구를 어떻게 썼는지) ─────────────────────────
+function brief(value) {
+  if (Array.isArray(value)) return `${value.length}건`;
+  if (value && typeof value === 'object') return '{…}';
+  const text = String(value);
+  return text.length > 120 ? text.slice(0, 120) + '…' : text;
+}
+
+function resultText(summary, isError) {
+  summary = summary || {};
+  if (isError || summary.error) return '실패';
+  if (summary.saved) return `${summary.applied}곳 고침` + (summary.failed ? ` · ${summary.failed}곳 실패` : '');
+  if (summary.created) return '파일 만듦';
+  if (summary.inspected) return summary.pages ? `${summary.pages}쪽 확인` : '확인';
+  const found = (summary.items || []).length + (summary.more || 0);
+  if (typeof summary.total === 'number') return `${summary.total.toLocaleString()}건` + (found && found < summary.total ? ` 중 ${found}건` : '');
+  if (summary.groups) return `${summary.groups}개 묶음`;
+  if (found) return `${found}건`;
+  return '완료';
 }
 
 function addStep(view, event) {
   if (!view.steps) {
     view.stepList = el('ol');
-    view.steps = el('details', {class: 'steps', open: ''}, el('summary', null, el('span', {class: 'spinner'}), el('span', {class: 'steps-label', text: '자료를 찾는 중'})), view.stepList);
+    view.steps = el('details', {class: 'steps', open: ''},
+                    el('summary', null, el('span', {class: 'spinner'}), el('span', {class: 'steps-label', text: '작업 중'}), icon('right')), view.stepList);
+    view.steps.querySelector('summary svg').classList.add('caret');
     view.body.before(view.steps);
   }
-  const detail = describe(event.arguments);
-  view.stepList.append(el('li', {class: 'running'}, el('span', {class: 'step-name', text: TOOLS[event.name] || event.name}),
-                          detail ? el('span', {class: 'step-args', text: detail}) : null));
-  view.steps.querySelector('.steps-label').textContent = `${TOOLS[event.name] || event.name}…`;
+  const args = Object.entries(event.arguments || event.args || {}).filter(([, value]) => value !== '' && value !== 0 && value !== null && value !== false);
+  const headline = args.filter(([key]) => !['limit', 'offset', 'file_id', 'blocks', 'sheets', 'markdown', 'search_in', 'sort'].includes(key)).slice(0, 3).map(([, value]) => brief(value)).join(' · ');
+  const list = el('dl');
+  for (const [key, value] of args) list.append(el('dt', {text: ARGS[key] || key}), el('dd', {text: brief(value)}));
+  const step = el('details', {class: 'step running'},
+                  el('summary', null, el('span', {class: 'step-name', text: TOOLS[event.name] || event.name}),
+                     headline ? el('span', {class: 'step-args', text: headline}) : null, el('span', {class: 'step-result'})),
+                  el('div', {class: 'step-body'}, list));
+  view.stepList.append(el('li', null, step));
+  view.steps.querySelector('.steps-label').textContent = `${TOOLS[event.name] || event.name} 중`;
+}
+
+function finishStep(view, event) {
+  const step = view.stepList && view.stepList.lastElementChild && view.stepList.lastElementChild.firstElementChild;
+  if (!step) return;
+  const summary = event.summary || {};
+  step.className = 'step ' + (event.is_error ? 'error' : 'done');
+  step.querySelector('.step-result').textContent = resultText(summary, event.is_error);
+  const body = step.querySelector('.step-body');
+  if (summary.error) body.append(el('p', {class: 'error', text: summary.error}));
+  if ((summary.items || []).length) {
+    const found = el('ul');
+    for (const item of summary.items) {
+      const source = state.sources.get(item.n);
+      found.append(el('li', null, source ? link(item.title, source.url) : el('span', {text: item.title})));
+    }
+    if (summary.more) found.append(el('li', {class: 'note', text: `외 ${summary.more}건`}));
+    body.append(found);
+  }
 }
 
 function finishSteps(view, stopped) {
   if (!view.steps) return;
   const count = view.stepList.childElementCount;
-  for (const item of view.stepList.querySelectorAll('.running')) item.className = stopped ? 'stopped' : 'done';
-  view.steps.querySelector('.spinner').replaceWith(icon(stopped ? 'alert' : 'check'));
-  view.steps.querySelector('.steps-label').textContent = `자료 조회 ${count}회`;
+  for (const item of view.stepList.querySelectorAll('.running')) item.className = 'step ' + (stopped ? 'stopped' : 'done');
+  const mark = view.steps.querySelector('.spinner');
+  if (mark) mark.replaceWith(icon(stopped ? 'alert' : 'check'));
+  view.steps.querySelector('.steps-label').textContent = `작업 ${count}단계` + (stopped ? ' (중단)' : '');
   view.steps.removeAttribute('open');
 }
 
@@ -310,10 +587,13 @@ async function openConversation(id) {
   if (!response.ok) return loadList();
   const item = await response.json();
   state.conversation = item.id;
+  state.sources = new Map((item.sources || []).map((source) => [source.n, source]));
   setTitle(item.title);
   clearThread();
   let last = null;
-  for (const message of item.messages) last = message.role === 'user' ? addUser(message.content) : addAssistant(message.content);
+  item.messages.forEach((message, index) => {
+    last = message.role === 'user' ? addUser(message.content, message.files) : addAssistant(message, index);
+  });
   if (last && last.node) addActions(last);
   closeSidebarOnMobile();
   renderList();
@@ -323,6 +603,7 @@ async function openConversation(id) {
 function newConversation() {
   if (state.busy) return;
   state.conversation = null;
+  state.sources = new Map();
   setTitle('');
   clearThread();
   closeSidebarOnMobile();
@@ -341,7 +622,7 @@ function setBusy(busy) {
 
 function updateSend() {
   const length = $('input').value.trim().length;
-  $('send').disabled = !state.busy && (!length || length > state.limit);
+  $('send').disabled = !state.busy && (!length || length > state.limit || state.uploading > 0);
   const counter = $('counter');
   counter.hidden = $('input').value.length < state.limit * 0.8;
   counter.textContent = `${$('input').value.length} / ${state.limit}`;
@@ -357,17 +638,21 @@ async function regenerate(view) {
 async function ask(question) {
   question = question.trim();
   if (state.busy || !question || question.length > state.limit) return;
-  addUser(question);
-  await run({message: question, conversation_id: state.conversation});
+  const attached = state.attachments;
+  state.attachments = [];
+  renderAttachments();
+  addUser(question, attached);
+  await run({message: question, conversation_id: state.conversation, attachments: attached.map((file) => file.id)});
 }
 
 async function run(payload) {
   setBusy(true);
-  const view = addAssistant('');
+  const view = addAssistant();
   view.node.classList.add('pending');
-  view.body.append(el('p', {class: 'thinking'}, el('span', {class: 'spinner'}), '생각하는 중'));
+  const started = performance.now(), clock = el('span', {class: 'clock'});
+  view.body.append(el('p', {class: 'thinking'}, el('span', {class: 'spinner'}), '생각하는 중', clock));
+  const ticking = setInterval(() => { if (clock.isConnected) clock.textContent = `${Math.floor((performance.now() - started) / 1000)}초`; }, 1000);
   scrollDown(true);
-  const started = performance.now();
   let buffer = '', scheduled = false, calls = 0, finished = false;
   const paint = () => {
     scheduled = false;
@@ -406,28 +691,36 @@ async function run(payload) {
         } else if (event.type === 'reset') {
           buffer = '';
           view.body.replaceChildren();
+        } else if (event.type === 'sources') {
+          for (const source of event.sources) state.sources.set(source.n, source);
         } else if (event.type === 'tool_call') {
           calls++;
           const stick = nearBottom();
           addStep(view, event);
           if (!buffer) view.body.replaceChildren();
           if (stick) scrollDown(true);
+        } else if (event.type === 'file') {
+          const stick = nearBottom();
+          addFile(view, event.file);
+          if (stick) scrollDown(true);
         } else if (event.type === 'tool_result') {
-          const item = view.stepList && view.stepList.lastElementChild;
-          if (item) item.className = event.is_error ? 'error' : 'done';
+          finishStep(view, event);
         } else if (event.type === 'answer') {
           finished = true;
           const stick = nearBottom();
           view.text = event.text || '';
           finishSteps(view, false);
+          view.node.classList.add('fresh');
           view.body.replaceChildren(markdown(view.text || '(빈 답)'));
+          renderSources(view);
           if (event.stopped === 'max_steps') view.body.append(el('p', {class: 'note', text: '조회 횟수 상한에 걸려 여기까지 찾은 내용으로 답했습니다.'}));
           if (event.stopped === 'length') view.body.append(el('p', {class: 'note', text: '답이 길이 상한에서 끊겼습니다.'}));
           view.node.classList.remove('pending');
-          view.meta.textContent = `${((performance.now() - started) / 1000).toFixed(1)}초` + (calls ? ` · 자료 조회 ${calls}회` : '');
+          view.meta.textContent = metaText((performance.now() - started) / 1000, calls);
           if (stick) scrollDown(true);
         } else if (event.type === 'done') {
           state.conversation = event.conversation_id;
+          view.index = event.index;
           setTitle(event.title);
           addActions(view);
         } else if (event.type === 'error') fail(event.message);
@@ -442,11 +735,204 @@ async function run(payload) {
       view.body.replaceChildren(buffer ? markdown(buffer) : '', el('p', {class: 'note', text: '답을 중단했습니다. 이 질문은 대화에 저장되지 않았습니다.'}));
     } else if (error.message !== 'login') fail('연결이 끊겼습니다. 다시 시도해 주세요.');
   } finally {
+    clearInterval(ticking);
     state.controller = null;
     setBusy(false);
     loadList().catch(() => {});
     $('input').focus();
   }
+}
+
+// ── 첨부 ────────────────────────────────────────────────────────────────
+function attachedInfo(file) {
+  const parts = [file.kind.toUpperCase(), file.pages ? `${file.pages}쪽` : ''];
+  if (file.editable) parts.push('원본을 직접 고칩니다');
+  else if (file.kind === 'pdf') parts.push('모양을 따라 새 문서로 만듭니다');
+  else if (file.edit_error) parts.push('읽기만 됩니다');
+  return parts.filter(Boolean).join(' · ');
+}
+
+function renderAttachments(message) {
+  const box = $('attachments');
+  box.replaceChildren();
+  for (const file of state.attachments) {
+    const remove = iconButton('x', '첨부 빼기', () => { state.attachments = state.attachments.filter((item) => item !== file); renderAttachments(); });
+    const mini = thumbnail(file, 'mini');
+    mini.addEventListener('click', () => openViewer(file));
+    box.append(el('span', {class: 'attached'}, mini, el('span', {class: 'attached-text'}, el('span', {class: 'attached-name', text: file.name, title: file.name}),
+                                                          el('span', {class: 'attached-info', text: attachedInfo(file)})), remove));
+  }
+  if (state.uploading) box.append(el('span', {class: 'attached busy'}, el('span', {class: 'spinner'}), el('span', {text: '올리는 중… 쪽 모양을 그리느라 몇 초 걸립니다'})));
+  if (message) box.append(el('span', {class: 'attached error'}, icon('alert'), el('span', {text: message})));
+  updateSend();
+}
+
+async function upload(file) {
+  if (!file) return;
+  if (state.attachments.length >= 3) return renderAttachments('첨부는 3개까지입니다.');
+  if (!/\.(pdf|hwp|hwpx|docx)$/i.test(file.name)) return renderAttachments('HWP, HWPX, DOCX, PDF 파일만 첨부할 수 있습니다.');
+  if (file.size > 15 * 1024 * 1024) return renderAttachments('파일이 너무 큽니다(15MB 이하).');
+  state.uploading++;
+  renderAttachments();
+  let message = '';
+  try {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const response = await api('/api/files', {method: 'POST', headers: {'X-Requested-With': 'rnd-chat'}, body: form});
+    const result = await response.json().catch(() => ({}));
+    if (response.ok) state.attachments.push(result); else message = result.error || '파일을 올리지 못했습니다.';
+  } catch (error) {
+    if (error.message !== 'login') message = '파일을 올리지 못했습니다.';
+  }
+  state.uploading--;
+  renderAttachments(message);
+  $('input').focus();
+}
+
+// ── 문서 미리보기(쪽 그림, 원본과 비교, 바뀐 내용) ──────────────────────
+const viewing = {file: null, pages: 0, original: false, observer: null};
+
+function changeRow(change) {
+  const where = {
+    set_cell: () => `표 ${Number(change.table) + 1} · ${Number(change.row) + 1}행 ${Number(change.col) + 1}열`,
+    replace_text: () => `글 바꾸기` + (change.replaced ? ` · ${change.replaced}곳` : ''),
+    set_paragraph: () => `본문 ${Number(change.paragraph) + 1}번째 문단`,
+    add_paragraphs: () => `본문 ${Number(change.after) + 1}번째 문단 뒤에 ${change.added || ''}줄 추가`,
+    add_row: () => `표 ${Number(change.table) + 1} · ${Number(change.row) + 1}행 아래에 행 추가`,
+    fill_field: () => `입력 칸 "${change.name}"`,
+  }[change.op];
+  const row = el(change.page ? 'button' : 'div', {class: 'change' + (change.ok ? '' : ' failed'), ...(change.page ? {type: 'button', title: `${change.page}쪽으로 가기`} : {})},
+                 el('div', {class: 'where'}, el('span', {text: (where ? where() : change.op) + (change.ok ? '' : ' · 고치지 못함')}),
+                    change.page ? el('span', {class: 'at', text: `${change.page}쪽`}) : null));
+  if (change.page) row.addEventListener('click', () => goToPage(change.page));
+  const before = change.op === 'replace_text' ? change.find : change.old, after = change.op === 'replace_text' ? change.replace : change.new;
+  if (!change.ok) row.append(el('p', {text: change.error || ''}));
+  else {
+    if (before) row.append(el('p', null, el('span', {class: 'was', text: before})));
+    if (after) row.append(el('p', null, el('span', {class: 'now', text: after})));
+    if (change.overflow) row.append(el('p', {class: 'note', text: '칸보다 길어 줄이 넘어갈 수 있습니다.'}));
+  }
+  return row;
+}
+
+function pageUrl(number) {
+  const file = viewing.original && viewing.file.root ? {id: viewing.file.root} : viewing.file;
+  return fileUrl(file, `/pages/${number}?size=full`);
+}
+
+function currentPage() {
+  const box = $('viewerpages'), top = box.getBoundingClientRect().top;
+  let best = 1;
+  for (const page of box.querySelectorAll('.page')) if (page.getBoundingClientRect().top - top < box.clientHeight / 2) best = Number(page.dataset.n);
+  return best;
+}
+
+function goToPage(number) {
+  const target = $('viewerpages').querySelector(`.page[data-n="${Math.max(1, Math.min(viewing.pages, number))}"]`);
+  if (!target) return;
+  target.scrollIntoView({block: 'start', behavior: 'smooth'});
+  target.classList.remove('flash');
+  void target.offsetWidth;
+  target.classList.add('flash');                           // 찾아간 쪽을 잠깐 표시한다
+}
+
+function turnPage(delta) { goToPage(currentPage() + delta); }
+
+function fillPages() {
+  const box = $('viewerpages');
+  if (viewing.observer) viewing.observer.disconnect();
+  viewing.observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const image = entry.target.querySelector('img');
+      if (!image.getAttribute('src')) image.src = pageUrl(Number(entry.target.dataset.n));
+      viewing.observer.unobserve(entry.target);
+    }
+  }, {root: box, rootMargin: '900px 0px'});
+  const keep = box.scrollTop;
+  box.replaceChildren();
+  for (let number = 1; number <= viewing.pages; number++) {
+    const image = el('img', {alt: `${number}쪽`});
+    const page = el('div', {class: 'page loading'}, image, el('span', {class: 'num', text: String(number)}));
+    page.dataset.n = String(number);
+    image.addEventListener('load', () => { page.classList.remove('loading'); image.classList.add('ready'); });
+    image.addEventListener('error', () => { page.classList.remove('loading'); image.replaceWith(el('p', {class: 'notice', text: '이 쪽은 그리지 못했습니다.'})); });
+    box.append(page);
+    viewing.observer.observe(page);
+  }
+  box.scrollTop = keep;
+  box.classList.toggle('original', viewing.original);
+  $('viewerpage').textContent = `${currentPage()} / ${viewing.pages}`;
+}
+
+async function openViewer(file) {
+  const dialog = $('viewer'), box = $('viewerpages');
+  viewing.file = file; viewing.pages = 0; viewing.original = false;
+  $('viewername').textContent = file.name;
+  $('viewerinfo').textContent = '불러오는 중';
+  $('viewerdownload').href = fileUrl(file);
+  $('viewerdownload').setAttribute('download', file.name);
+  for (const id of ['viewercompare', 'viewerchanges', 'viewerside', 'viewerpager']) $(id).hidden = true;
+  box.replaceChildren(el('p', {class: 'notice'}, el('span', {class: 'spinner'})));
+  if (!dialog.open) dialog.showModal();
+  let info;
+  try {
+    info = await (await api(fileUrl(file, '/info'))).json();
+  } catch { info = {error: '파일 정보를 받지 못했습니다.'}; }
+  if (viewing.file !== file) return;                        // 그사이 다른 파일을 열었다
+  if (info.error || info.preview_error || !info.pages) {
+    $('viewerinfo').textContent = KIND[file.kind] || file.kind;
+    box.replaceChildren(el('p', {class: 'notice', text: (info.error || info.preview_error || '쪽 모양을 그리지 못했습니다.') + ' 내려받아 확인해 주세요.'}));
+    return;
+  }
+  viewing.file = Object.assign(file, info);
+  viewing.pages = Math.min(info.pages, 60);
+  $('viewerinfo').textContent = [KIND[info.kind] || info.kind, `${info.pages}쪽`, size(info.size)].join(' · ') + (info.pages > 60 ? ' · 앞 60쪽만 표시' : '');
+  $('viewerpager').hidden = false;
+  if (info.root) {
+    $('viewercompare').hidden = false;
+    $('viewercompare').setAttribute('aria-pressed', 'false');
+    $('viewercompare').lastElementChild.textContent = '원본 보기';
+  }
+  if ((info.changes || []).length) {
+    const side = $('viewerside');
+    side.replaceChildren(el('h3', {text: `바뀐 내용 ${info.changes.length}건`}), ...info.changes.map(changeRow));
+    side.hidden = matchMedia('(max-width: 820px)').matches;
+    $('viewerchanges').hidden = false;
+    $('viewerchanges').setAttribute('aria-pressed', String(!side.hidden));
+  }
+  box.scrollTop = 0;
+  fillPages();
+  box.focus();
+}
+
+function bindViewer() {
+  const dialog = $('viewer'), box = $('viewerpages');
+  $('viewerclose').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => { if (viewing.observer) viewing.observer.disconnect(); box.replaceChildren(); viewing.file = null; });
+  $('viewerprev').addEventListener('click', () => turnPage(-1));
+  $('viewernext').addEventListener('click', () => turnPage(1));
+  $('viewercompare').addEventListener('click', () => {
+    viewing.original = !viewing.original;
+    $('viewercompare').setAttribute('aria-pressed', String(viewing.original));
+    $('viewercompare').lastElementChild.textContent = viewing.original ? '원본 보는 중' : '원본 보기';
+    fillPages();
+  });
+  $('viewerchanges').addEventListener('click', () => {
+    $('viewerside').hidden = !$('viewerside').hidden;
+    $('viewerchanges').setAttribute('aria-pressed', String(!$('viewerside').hidden));
+  });
+  let ticking = false;
+  box.addEventListener('scroll', () => {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(() => { ticking = false; if (viewing.pages) $('viewerpage').textContent = `${currentPage()} / ${viewing.pages}`; });
+  }, {passive: true});
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowRight' || event.key === 'PageDown') { event.preventDefault(); turnPage(1); }
+    else if (event.key === 'ArrowLeft' || event.key === 'PageUp') { event.preventDefault(); turnPage(-1); }
+    else if (event.key.toLowerCase() === 'o' && !$('viewercompare').hidden) $('viewercompare').click();
+  });
 }
 
 // ── 사이드바·메뉴·테마 ──────────────────────────────────────────────────
@@ -478,7 +964,7 @@ function applyTheme(theme) {
   if (theme === 'light' || theme === 'dark') root.dataset.theme = theme; else delete root.dataset.theme;
   try { if (theme === 'system') localStorage.removeItem('theme'); else localStorage.setItem('theme', theme); } catch { /* 무시 */ }
   $('themeicon').setAttribute('href', {light: '#i-sun', dark: '#i-moon', system: '#i-monitor'}[theme]);
-  $('themelabel').textContent = '테마: ' + {light: '밝게', dark: '어둡게', system: '시스템 설정'}[theme];
+  $('themelabel').textContent = '화면: ' + {light: '밝게', dark: '어둡게', system: '시스템 설정'}[theme];
   $('theme').dataset.theme = theme;
 }
 
@@ -501,6 +987,23 @@ $('input').addEventListener('input', (event) => {
   event.target.style.height = Math.min(event.target.scrollHeight, 220) + 'px';
   updateSend();
 });
+$('attach').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', (event) => { upload(event.target.files[0]); event.target.value = ''; });
+
+// 파일을 화면 어디에 끌어다 놓아도 첨부된다
+let dragDepth = 0;
+const hasFiles = (event) => event.dataTransfer && [...event.dataTransfer.types].includes('Files');
+addEventListener('dragenter', (event) => { if (hasFiles(event) && !$('viewer').open) { dragDepth++; $('drop').hidden = false; } });
+addEventListener('dragleave', (event) => { if (hasFiles(event) && --dragDepth <= 0) { dragDepth = 0; $('drop').hidden = true; } });
+addEventListener('dragover', (event) => { if (hasFiles(event)) event.preventDefault(); });
+addEventListener('drop', (event) => {
+  if (!hasFiles(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  $('drop').hidden = true;
+  if (!$('viewer').open) upload(event.dataTransfer.files[0]);
+});
+
 $('new').addEventListener('click', newConversation);
 $('newtop').addEventListener('click', newConversation);
 $('collapse').addEventListener('click', () => setSidebar(false));
@@ -509,17 +1012,26 @@ $('backdrop').addEventListener('click', closeSidebarOnMobile);
 $('filter').addEventListener('input', renderList);
 $('tobottom').addEventListener('click', () => scrollDown(true));
 $('scroll').addEventListener('scroll', () => { $('tobottom').hidden = nearBottom(); });
-for (const button of $('suggestions').querySelectorAll('button')) button.addEventListener('click', () => ask(button.dataset.q));
+for (const button of $('suggestions').querySelectorAll('button')) {
+  button.addEventListener('click', () => { if (button.dataset.action === 'attach') $('file').click(); else ask(button.dataset.q); });
+  if (button.dataset.action === 'attach') {              // 양식 알약에 올리면 입력창의 첨부 단추가 움직여, 같은 일을 하는 곳을 알려 준다
+    for (const [name, on] of [['pointerenter', true], ['focus', true], ['pointerleave', false], ['blur', false]]) button.addEventListener(name, () => $('attach').classList.toggle('nudge', on));
+  }
+}
 bindMenu($('user'), $('usermenu'));
 bindMenu($('status'), $('statusmenu'));
+bindCitations();
+bindViewer();
 document.addEventListener('click', () => {
   for (const menu of document.querySelectorAll('.menu')) menu.hidden = true;
   for (const button of document.querySelectorAll('[aria-expanded]')) button.setAttribute('aria-expanded', 'false');
 });
 $('theme').addEventListener('click', () => applyTheme({system: 'light', light: 'dark', dark: 'system'}[$('theme').dataset.theme]));
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') { closeSidebarOnMobile(); for (const menu of document.querySelectorAll('.menu')) menu.hidden = true; }
+  if (event.key === 'Escape') { closeSidebarOnMobile(); hideCard(true); for (const menu of document.querySelectorAll('.menu')) menu.hidden = true; }
   if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'o') { event.preventDefault(); newConversation(); }
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName) || document.activeElement.isContentEditable;
+  if (event.key === '/' && !typing && !$('viewer').open && !event.ctrlKey && !event.metaKey) { event.preventDefault(); $('input').focus(); }
 });
 applyTheme(root.dataset.theme || 'system');
 
@@ -541,7 +1053,6 @@ async function loadStatus() {
 (async () => {
   try {
     if (!await loadStatus()) setTimeout(() => loadStatus().catch(() => {}), 2500);     // 서버가 막 떴으면 자료 서버 확인이 조금 늦다
-    $('greeting').textContent = `${state.name}님, 무엇을 찾아 드릴까요?`;
     await loadList();
     updateSend();
     $('input').focus();

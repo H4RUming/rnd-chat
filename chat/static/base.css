@@ -1,0 +1,77 @@
+/* 공통 바탕: 글꼴, 색, 작은 부품. 로그인 화면과 채팅 화면이 함께 쓴다.
+   바탕은 흰색, 글과 선은 무채색. 색(남보라에서 분홍으로 이어지는 --grad 와 그 두 끝 --accent, --accent-2)은 누르는 곳·초점·근거 표시 같은 포인트에만 쓴다. */
+/* 글꼴은 D2Coding 하나로 고정한다(본문·제목·숫자·코드 모두). 자주 쓰는 글자만 추린 파일을 먼저 받고,
+   거기 없는 글자(드문 한글·한자)가 나올 때만 전체 파일을 받는다 — 겹치는 범위는 뒤에 적은 규칙이 먼저 쓰인다. */
+@font-face { font-family: "D2Coding"; font-weight: 400; font-display: swap; src: url(/static/d2coding-400-all.woff2) format("woff2"); unicode-range: U+3400-9FFF, U+AC00-D7A3, U+F900-FAFF; }
+@font-face { font-family: "D2Coding"; font-weight: 700; font-display: swap; src: url(/static/d2coding-700-all.woff2) format("woff2"); unicode-range: U+3400-9FFF, U+AC00-D7A3, U+F900-FAFF; }
+@font-face { font-family: "D2Coding"; font-weight: 400; font-display: swap; src: url(/static/d2coding-400.woff2) format("woff2"); }
+@font-face { font-family: "D2Coding"; font-weight: 700; font-display: swap; src: url(/static/d2coding-700.woff2) format("woff2"); }
+
+:root {
+  --paper: #ffffff; --surface: #ffffff; --sunken: #f6f6f7; --hover: #eeeef0; --line: #e9e9ec; --line-strong: #d6d6db;
+  --ink: #18181b; --ink-2: #55555d; --ink-3: #8e8e97; --on-ink: #ffffff;
+  --accent: #5a3df0; --accent-2: #ee86ab; --on-accent: #ffffff;
+  --grad: linear-gradient(100deg, #5a3df0 0%, #8a6ae8 42%, #cf9fdc 76%, #f6b8c6 100%); --on-grad: #ffffff;
+  --seal: var(--accent); --on-seal: var(--on-accent);
+  --marker: #f3a9bd; --marker-soft: rgba(243, 160, 186, .34); --marker-strong: rgba(240, 140, 172, .62);
+  --ok: #2c7a4b; --warn: #a86400; --error: #c22a35; --link: #4a33d4;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .05), 0 12px 32px rgba(0, 0, 0, .10);
+  --ring: 0 0 0 3px rgba(90, 61, 240, .16);
+  --sans: "D2Coding", ui-monospace, "Nanum Gothic Coding", monospace;      /* 뒤의 이름들은 글꼴 파일을 받는 동안만 쓰인다 */
+  --serif: var(--sans); --mono: var(--sans);                                /* 셋 다 같은 글꼴: 화면 글꼴을 하나로 고정 */
+  --radius: 10px; --side-width: 272px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #131315; --surface: #1c1c1f; --sunken: #0c0c0e; --hover: #27272b; --line: #2a2a2f; --line-strong: #404047;
+    --ink: #ededf0; --ink-2: #a9a9b1; --ink-3: #75757d; --on-ink: #131315;
+    --accent: #8f7aff; --accent-2: #f3a9bd; --on-accent: #131315;
+    --grad: linear-gradient(100deg, #6f55ff 0%, #9a7df0 42%, #d3a3e0 76%, #f6b8c6 100%); --on-grad: #ffffff;
+    --marker: #f3a9bd; --marker-soft: rgba(243, 160, 186, .22); --marker-strong: rgba(243, 160, 186, .42);
+    --ok: #55c88a; --warn: #f0a94a; --error: #ff8a8a; --link: #a99bff;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 14px 36px rgba(0, 0, 0, .5);
+    --ring: 0 0 0 3px rgba(143, 122, 255, .26);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #131315; --surface: #1c1c1f; --sunken: #0c0c0e; --hover: #27272b; --line: #2a2a2f; --line-strong: #404047;
+  --ink: #ededf0; --ink-2: #a9a9b1; --ink-3: #75757d; --on-ink: #131315;
+  --accent: #8f7aff; --accent-2: #f3a9bd; --on-accent: #131315;
+  --grad: linear-gradient(100deg, #6f55ff 0%, #9a7df0 42%, #d3a3e0 76%, #f6b8c6 100%); --on-grad: #ffffff;
+  --marker: #f3a9bd; --marker-soft: rgba(243, 160, 186, .22); --marker-strong: rgba(243, 160, 186, .42);
+  --ok: #55c88a; --warn: #f0a94a; --error: #ff8a8a; --link: #a99bff;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 14px 36px rgba(0, 0, 0, .5);
+  --ring: 0 0 0 3px rgba(143, 122, 255, .26);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--paper); color: var(--ink); font: 15px/1.7 var(--sans); -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+button, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; border: 0; background: none; padding: 0; }
+button:disabled { cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+a { color: var(--link); text-decoration: none; overflow-wrap: anywhere; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+svg { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+::selection { background: var(--marker-strong); color: inherit; }
+[hidden] { display: none !important; }
+.sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+.offscreen { position: fixed; left: -9999px; top: 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.spacer { flex: 1; }
+
+/* 표지: 마디와 선으로 그린 R. 다리 끝의 분홍 마디가 '찾아낸 자료' 다. 글자 크기(em)에 맞춰 커진다. */
+.logo { width: 1em; height: 1em; flex: none; color: var(--accent); stroke-width: 2.4; overflow: visible; }
+.logo-node { fill: currentColor; stroke: none; }
+.logo-spark { fill: var(--accent-2); stroke: none; }
+
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line-strong); border-top-color: var(--ink); animation: spin .8s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 2.4s; }
+  *, *::before, *::after { transition-duration: .01ms !important; animation-delay: 0s !important; }
+}

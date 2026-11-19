@@ -8,7 +8,9 @@ base_url = "http://127.0.0.1:8000/v1"
 model = "hai"
 api_key = ""            # 필요 없으면 비워 둔다
 temperature = 0.3
-max_tokens = 4096       # 답 하나의 최대 길이
+max_tokens = 16000      # 답 하나의 최대 길이(문서를 만들 때는 내용 전체가 여기에 들어가야 한다)
+# thinking = false       # 생각하는 모델(Qwen 등)에서 답하기 전의 속생각을 끈다. 빨라지지만 복잡한 질문의 품질이 떨어질 수 있다.
+#                        # 속생각도 max_tokens 에 들어간다. 적지 않으면 모델 기본을 따른다.
 timeout = 300           # 초
 
 [agent]
@@ -52,3 +54,8 @@ allowed_hosts = ["127.0.0.1", "localhost"]   # 이 이름으로 온 요청만 �
 # [[users]]
 # name = "이름"
 # password_hash = "scrypt$..."
+
+# 첨부한 한글 문서(HWP·HWPX)를 고치는 엔진 rhwp(https://github.com/edwardkim/rhwp)의 실행 파일.
+# 비워 두면 PATH 에서 rhwp 를 찾고, 없으면 한글 문서는 읽기만 된다(워드 문서는 엔진 없이 고친다).
+# [documents]
+# rhwp = "/opt/rhwp/rhwp"

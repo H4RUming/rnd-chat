@@ -24,13 +24,18 @@ class Client:
         await self._http.aclose()
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                       on_text: Callable[[str], Awaitable[None] | None] | None = None) -> dict[str, Any]:
+                       on_text: Callable[[str], Awaitable[None] | None] | None = None, thinking: bool | None = None) -> dict[str, Any]:
         """답 하나를 받는다. 돌려주는 것: {'content': 글, 'tool_calls': [{'id', 'name', 'arguments'}], 'finish_reason', 'usage'}.
 
         on_text 를 주면 스트리밍으로 받아, 글이 조각조각 올 때마다 on_text(조각)을 부른다. 돌려주는 값은 같다.
+        thinking: 답하기 전에 속으로 따져 보게 할지(생각하는 모델에서만 뜻이 있다). None 이면 설정을, 설정도 없으면 모델 기본을 따른다.
         """
         body: dict[str, Any] = {'model': self.settings.model, 'messages': messages, 'temperature': self.settings.temperature,
                                 'max_tokens': self.settings.max_tokens}
+        if thinking is None and self.settings.thinking:
+            thinking = self.settings.thinking == 'on'
+        if thinking is not None:                         # vLLM 이 대화 틀(chat template)에 넘겨 주는 값. 모르는 모델은 무시한다
+            body['chat_template_kwargs'] = {'enable_thinking': thinking}
         if tools:
             body['tools'] = tools
         if on_text is not None:

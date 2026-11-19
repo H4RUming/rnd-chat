@@ -20,6 +20,8 @@ class ToolResult:
     text: str
     images: list[tuple[str, str]] = field(default_factory=list)     # (mime, base64)
     is_error: bool = False
+    files: list[dict[str, Any]] = field(default_factory=list)       # 도구가 만든 파일(화면에 내려받기 카드로 나간다)
+    summary: dict[str, Any] = field(default_factory=dict)           # 화면의 작업 단계에 보여 줄 요약(건수, 찾은 자료 이름 등)
 
 
 @dataclass(frozen=True)
