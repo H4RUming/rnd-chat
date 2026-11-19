@@ -79,7 +79,7 @@ class SecurityHeaders:
                 extra = {b'content-security-policy': CSP.encode(), b'x-content-type-options': b'nosniff', b'x-frame-options': b'DENY',
                          # no-referrer 로 두면 브라우저가 같은 사이트의 폼 전송에도 Origin: null 을 보내 로그인이 막힌다(실측)
                          b'referrer-policy': b'same-origin', b'permissions-policy': b'camera=(), microphone=(), geolocation=()',
-                         b'cache-control': b'no-store'}
+                         b'cache-control': b'no-store, no-transform'}       # no-transform: 앞단(Cloudflare)이 화면에 스크립트를 끼워 넣지 못하게
                 if https:                # https 에서만 뜻이 있다(http 에서는 브라우저가 무시하고 경고를 낸다)
                     extra[b'cross-origin-opener-policy'] = b'same-origin'
                 if forwarded:

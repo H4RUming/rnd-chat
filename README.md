@@ -73,7 +73,7 @@ password_hash = "scrypt$…"
 - **비밀번호는 scrypt 해시로 대조합니다.**
 - **요청 위조 방지.** 상태를 바꾸는 요청은 `Origin`이 같은 호스트여야 하고, API는 전용 헤더까지 있어야 합니다.
 - **허용한 호스트 이름으로 온 요청만 받습니다**(`allowed_hosts`). 외부 공개 시 공개 도메인을 더합니다.
-- **보안 헤더.** 모든 응답에 CSP(인라인 스크립트 금지, 외부 자원 금지), `X-Frame-Options: DENY`, `nosniff`, `Cache-Control: no-store`를 붙입니다. https로 들어온 요청에는 HSTS도 붙습니다. 화면은 외부 글꼴·스크립트 없이 이 서버의 파일만 씁니다.
+- **보안 헤더.** 모든 응답에 CSP(인라인 스크립트 금지, 외부 자원 금지), `X-Frame-Options: DENY`, `nosniff`, `Cache-Control: no-store, no-transform`을 붙입니다(`no-transform`은 Cloudflare 같은 앞단이 화면에 분석 스크립트를 끼워 넣지 못하게 합니다). https로 들어온 요청에는 HSTS도 붙습니다. 화면은 외부 글꼴·스크립트 없이 이 서버의 파일만 씁니다.
 - **모델의 답은 신뢰하지 않습니다.** 브라우저에서 `innerHTML` 없이 DOM 노드로만 그리고, 링크는 http·https만 허용합니다.
 - **대화는 계정별로 따로 둡니다.** 남의 대화는 id를 알아도 볼 수 없습니다.
 - **동시에 처리하는 질문 수를 묶습니다**(`max_concurrent`). 한 사람이 답을 기다리는 동안 또 보낼 수 없습니다.

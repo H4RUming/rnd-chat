@@ -186,7 +186,7 @@ class WebTests(unittest.TestCase):
             self.assertEqual((headers['x-content-type-options'], headers['x-frame-options'], headers['referrer-policy']),
                              ('nosniff', 'DENY', 'same-origin'), path)
             self.assertNotIn('strict-transport-security', headers)
-        self.assertEqual(client.get('/login').headers['cache-control'], 'no-store')
+        self.assertEqual(client.get('/login').headers['cache-control'], 'no-store, no-transform')
         self.assertIn('max-age', client.get('/login', headers={'x-forwarded-proto': 'https'}).headers['strict-transport-security'])
         self.assertEqual(client.get('/login', headers={'host': 'evil.example'}).status_code, 400)
 
