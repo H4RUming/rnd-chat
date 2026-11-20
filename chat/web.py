@@ -624,7 +624,9 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
 
     async def index(request: Request) -> Response:
         if current(request) is None:
-            return RedirectResponse('/login', status_code=303)
+            # 메일의 링크처럼 다른 사이트에서 넘어온 첫 요청에는 브라우저가 세션 쿠키를 싣지 않는다(SameSite=Strict). 그래서 로그인돼 있어도
+            # 여기로 온다: 로그인 화면이 떠서 스스로 확인해 보고(login.js) 로그인돼 있으면 가려던 곳으로 돌아온다.
+            return RedirectResponse('/login' + ('?next=accounts' if request.query_params.get('view') == 'accounts' else ''), status_code=303)
         return Response((STATIC / 'index.html').read_bytes(), media_type='text/html; charset=utf-8')
 
     async def static(request: Request) -> Response:
@@ -684,8 +686,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
     async def signup_page(request: Request) -> Response:
         if not signup_open:
             return Response('not found', status_code=404)
-        if current(request) is not None:
-            return RedirectResponse('/', status_code=303)
+        # 로그인돼 있어도 이 화면은 그대로 보인다(본 화면으로 보내면 "회원가입을 눌렀더니 로그인됐다"로 보인다)
         return Response((STATIC / 'signup.html').read_bytes(), media_type='text/html; charset=utf-8')
 
     async def signup_api(request: Request) -> Response:
@@ -783,19 +784,20 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             return RedirectResponse('/login?error=origin', status_code=303)
         form = await request.form()
         name, password = str(form.get('username') or '').strip()[:64], str(form.get('password') or '')
+        onward = 'accounts' if form.get('next') == 'accounts' else ''      # 로그인한 뒤 갈 곳(알림 메일의 "검토하러 가기"). 정해 둔 값만 받는다
         ip = client_ip(request)
         if throttle.locked_for(name) or ip_throttle.locked_for(ip):
             log.warning('login blocked (locked) name=%r ip=%s', name, ip)
-            return RedirectResponse('/login?error=locked', status_code=303)
+            return RedirectResponse('/login?error=locked' + ('&next=accounts' if onward else ''), status_code=303)
         adopt(name)
         if not users.verify(name, password):
             throttle.failure(name)
             ip_throttle.failure(ip)
             log.warning('login failed name=%r ip=%s', name, ip)
-            return RedirectResponse('/login?error=1', status_code=303)
+            return RedirectResponse('/login?error=1' + ('&next=accounts' if onward else ''), status_code=303)
         throttle.success(name)
         log.info('login ok user=%s ip=%s', name, ip)
-        response = RedirectResponse('/', status_code=303)
+        response = RedirectResponse('/?view=accounts' if onward else '/', status_code=303)
         response.set_cookie(COOKIE, sessions.create(name, users.stamp(name)), max_age=int(sessions.lifetime), httponly=True, samesite='strict',
                             secure=is_https(request), path='/')
         return response

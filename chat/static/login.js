@@ -3,6 +3,14 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const form = $('login'), name = $('username'), password = $('password'), go = $('go');
+
+  // 이미 로그인돼 있으면 이 화면을 보일 까닭이 없다: 가려던 곳으로 보낸다. 메일의 링크처럼 다른 사이트에서 넘어온 첫 요청에는
+  // 브라우저가 세션 쿠키를 싣지 않아 로그인돼 있어도 여기로 오는데, 이 화면에서 보내는 요청에는 쿠키가 실린다.
+  const onward = new URLSearchParams(location.search).get('next') === 'accounts' ? 'accounts' : '';
+  $('next').value = onward;
+  fetch('/api/me', {credentials: 'same-origin'}).then((response) => {
+    if (response.ok) location.replace(onward ? '/?view=accounts' : '/');
+  }).catch(() => { /* 연결이 안 되면 그대로 로그인 화면이다 */ });
   const fields = [[name, $('namehelp')], [password, $('passwordhelp')]];
 
   const mark = (input, help, bad) => {

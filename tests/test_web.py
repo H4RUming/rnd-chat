@@ -920,6 +920,24 @@ class WebTests(unittest.TestCase):
         database.add_account('kim', 'x@example.org', HASH, 1.0)                               # 설정의 계정과 이름이 겹치는 신청은 등록하지 않는다
         self.assertEqual((run('approve', 'kim')[0], [account['status'] for account in database.accounts() if account['name'] == 'kim']), (1, ['pending']))
 
+    def test_a_logged_in_visitor_is_not_left_on_the_login_page_and_signup_does_not_log_anyone_in(self):
+        self.signup_app()
+        guest, kim = self.client(), self.client('kim')
+        # 로그인하지 않은 사람: 본 화면은 로그인 화면으로 보내고(알림 메일의 링크면 갈 곳을 기억해 둔다), 회원가입 화면은 그대로 보인다
+        self.assertEqual((guest.get('/').headers['location'], guest.get('/?view=accounts').headers['location'], guest.get('/?view=evil').headers['location']),
+                         ('/login', '/login?next=accounts', '/login'))
+        self.assertEqual((guest.get('/signup').status_code, guest.get('/api/me').status_code, 'set-cookie' in guest.get('/signup').headers), (200, 401, False))
+        # 로그인 화면은 스스로 로그인 여부를 확인해 가려던 곳으로 보낸다(다른 사이트에서 넘어온 첫 요청에는 쿠키가 실리지 않는다)
+        script = guest.get('/static/login.js').text
+        self.assertTrue("fetch('/api/me'" in script and "location.replace(onward ? '/?view=accounts' : '/')" in script and 'name="next"' in guest.get('/login').text)
+        # 로그인한 사람이 회원가입 화면을 열어도 본 화면으로 튀지 않는다
+        self.assertEqual((kim.get('/signup').status_code, 'location' in kim.get('/signup').headers), (200, False))
+        # 로그인하면 기억해 둔 곳으로 간다. 정해 둔 값이 아니면 무시한다
+        go = lambda **form: self.client().post('/login', data={'username': 'kim', 'password': PASSWORD, **form}, headers=ORIGIN).headers['location']
+        self.assertEqual((go(next='accounts'), go(next='https://evil.example/'), go()), ('/?view=accounts', '/', '/'))
+        wrong = self.client().post('/login', data={'username': 'kim', 'password': 'wrong', 'next': 'accounts'}, headers=ORIGIN)
+        self.assertEqual(wrong.headers['location'], '/login?error=1&next=accounts')
+
     def test_signup_requests_are_limited(self):
         self.signup_app(per_hour=4, max_pending=3)
         guest = self.client()
