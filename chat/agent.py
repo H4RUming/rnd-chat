@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 import json
+import re
 from typing import Any, Awaitable, Callable
 
 from . import sweep
@@ -137,6 +138,8 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
     seen: dict[tuple[str, str], dict[str, Any]] = {}    # 그 호출이 돌려준 결과의 요약(되풀이해 부르면 무엇이 나왔었는지 다시 알려 준다)
     stuck = False
     repeating = False                                   # 새로 찾는 것 없이 같은 조회만 되풀이해 마무리로 넘어갔는지
+    partial: dict[str, tuple[int, int]] = {}            # 검색 도구 → (전체 건수, 가져온 건수): 마지막 검색이 일부만 가져온 것
+    reminded = False                                    # 일부만 보고 답하려 해서 끝까지 확인하라고 한 번 돌려보냈는지
     spent = 0                                           # 이번 질문에서 모델에 넘긴 도구 결과의 글자 수
     # 속생각은 무엇을 어떻게 찾을지 정하는 앞 단계에서만 쓴다. 검색 결과 수만 자를 받은 뒤에도 켜 두면 답 하나에
     # 몇 분이 걸린다(실측: 속생각 3만 7천 토큰, 5분). 결과를 읽고 정리하는 단계는 생각 없이도 차이가 없었다.
@@ -167,6 +170,16 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
             for key in usage:
                 usage[key] += int(reply['usage'].get(key) or 0)
         calls = reply['tool_calls']
+        if not calls and partial and not reminded and _lists_items(reply['content']):
+            # 여러 건을 골라 싣는 답인데, 검색 결과의 일부만 가져온 채다. 가장 강조된 규칙(일부만 보고 답하지 않는다)을 모델이
+            # 건너뛰는 일이 있어(실측: 세 번에 한 번), 답을 받지 않고 한 번 돌려보낸다.
+            reminded = True
+            name, (total, got) = next(iter(partial.items()))
+            await emit({'type': 'reset'})
+            messages.append({'role': 'user', 'content': (
+                f'아직 답하지 마세요. {name} 검색은 전체 {total:,}건 가운데 {got:,}건만 가져왔습니다. 일부만 보고 고른 답은 내지 않습니다. '
+                'review_all 로 같은 조건의 결과를 끝까지 확인하거나, 조건을 좁혀 전체가 한 번에 들어오게 다시 찾은 뒤 답하세요.')})
+            continue
         if not calls:
             messages.append({'role': 'assistant', 'content': reply['content']})
             stopped = 'length' if reply['finish_reason'] == 'length' else ''
@@ -223,6 +236,14 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                 if not result.is_error and not repeated:
                     done[same] = 1
                     seen[same] = result.summary or {}
+                    if call['name'] == sweep.NAME:               # 끝까지 확인했다: 그 검색은 더 묻지 않는다
+                        partial.pop(str(arguments.get('tool') or ''), None)
+                    elif call['name'] in sweep.SEARCH_TOOLS:
+                        total, got = _coverage(result.summary or {})
+                        if total > got > 0:
+                            partial[call['name']] = (total, got)
+                        else:
+                            partial.pop(call['name'], None)
             new_calls += 0 if repeated else 1
             # 결과 하나의 상한과, 질문 하나에 넘기는 합의 상한(모델이 한 번에 읽을 수 있는 양을 넘으면 요청 자체가 실패한다)
             text = _clip(result.text, min(limits.tool_result_chars, max(2000, limits.turn_result_chars - spent)))
@@ -273,6 +294,17 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
     stopped = '' if repeating else 'max_steps'
     await emit({'type': 'answer', 'text': reply['content'], 'stopped': stopped})
     return Outcome(reply['content'], messages, step if repeating else limits.max_steps, stopped, usage)
+
+
+def _coverage(summary: dict[str, Any]) -> tuple[int, int]:
+    """검색 결과의 (전체 건수, 이번에 가져온 건수)."""
+    total = summary.get('total')
+    return (total if isinstance(total, int) else 0), len(summary.get('items') or []) + int(summary.get('more') or 0)
+
+
+def _lists_items(answer: str) -> bool:
+    """여러 건을 골라 싣는 답인가(표가 있고 줄이 셋을 넘는다). 한 건을 묻거나 설명을 구하는 질문의 답은 건드리지 않는다."""
+    return len(re.findall(r'^\s*\|.*\|\s*$', answer or '', re.M)) >= 5
 
 
 _WORD_FIELDS = ('query', 'query_text', 'and_text', 'words')

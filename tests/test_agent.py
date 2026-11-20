@@ -324,6 +324,47 @@ class StuckTests(unittest.TestCase):
         self.assertIn('필요한 조회는 이미 다 했습니다', llm.requests[2][0][-1]['content'])
         self.assertIsNone(llm.requests[-1][1])
 
+    def test_a_listing_answer_from_part_of_the_results_is_sent_back_once(self):
+        table = '과제 300건 가운데 고른 것입니다.\n\n| 과제 | 기관 |\n|---|---|\n| 가 | A |\n| 나 | B |\n| 다 | C |'
+        page = lambda total: tools.ToolResult(json.dumps({'total': total, 'results': [{'title': '가'}, {'title': '나'}]}))
+
+        class Local:                                                   # 자료 서버의 결과에서 전체 건수와 가져온 건수를 읽어 주는 쪽
+            sources = type('S', (), {'take_fresh': staticmethod(lambda: [])})()
+
+            def specs(self):
+                return []
+
+            async def call(self, name, arguments):
+                return None
+
+            def observe(self, name, arguments, text, is_error):
+                data = json.loads(text)
+                return text, {'total': data['total'], 'items': data['results']}
+
+        def answer(hub, replies):
+            llm = ScriptedLlm(replies)
+            events = []
+            outcome = asyncio.run(agent.run(llm, hub, [{'role': 'user', 'content': 'q'}], Limits(max_steps=12), events.append, Local()))
+            return llm, outcome, [event['type'] for event in events]
+        search = {'tool_calls': [call('search_projects', {'query_text': '양자'})]}
+        # 300건 가운데 2건만 가져온 채 표로 답하려 하면, 그 답을 받지 않고 끝까지 확인하라고 한 번 돌려보낸다
+        llm, outcome, kinds = answer(FakeHub({'search_projects': page(300)}), [search, {'content': table}, {'content': table + '\n(다시 쓴 답)'}])
+        self.assertEqual((outcome.answer.endswith('(다시 쓴 답)'), len(llm.requests), 'reset' in kinds), (True, 3, True))
+        nudge = llm.requests[2][0][-1]
+        self.assertTrue(nudge['role'] == 'user' and '전체 300건 가운데 2건만' in nudge['content'] and 'review_all' in nudge['content'], nudge)
+        # 전부 가져왔거나, 한 건을 묻는 질문의 짧은 답이면 그대로 받는다. 조건을 좁혀 다 가져온 뒤의 답도 그대로 받는다
+        for hub, replies, calls in ((FakeHub({'search_projects': page(2)}), [search, {'content': table}], 2),
+                                    (FakeHub({'search_projects': page(300)}), [search, {'content': '그 과제의 수행기관은 A 입니다.'}], 2)):
+            llm, outcome, _ = answer(hub, replies)
+            self.assertEqual(len(llm.requests), calls)
+        narrowed = FakeHub({'search_projects': lambda arguments: page(2 if arguments.get('year_from') else 300)})
+        llm, outcome, _ = answer(narrowed, [search, {'tool_calls': [call('search_projects', {'query_text': '양자', 'year_from': 2026})]}, {'content': table}])
+        self.assertEqual((len(llm.requests), outcome.answer), (3, table))
+        # 돌려보낸 뒤 다시 찾아(조건을 좁혀) 답하는 흐름도 끝까지 돈다
+        llm, outcome, _ = answer(narrowed, [search, {'content': table}, {'tool_calls': [call('search_projects', {'query_text': '양자', 'year_from': 2026})]}, {'content': table}])
+        self.assertEqual((len(llm.requests), outcome.answer, len(narrowed.calls)), (4, table, 4))      # (앞의 두 번에 더해) 처음 검색과 좁힌 검색
+        self.assertEqual((agent._lists_items(table), agent._lists_items('| a | b |\n|---|---|\n| 1 | 2 |'), agent._coverage({'total': 9, 'items': [1, 2], 'more': 3})), (True, False, (9, 5)))
+
     def test_the_same_words_in_another_order_or_repeated_are_the_same_search(self):
         first = call('search', {'query_text': '양자컴퓨팅|양자 알고리즘|큐비트', 'limit': 100})
         again = call('search', {'limit': 100, 'query_text': '큐비트|양자 알고리즘|양자  알고리즘|양자컴퓨팅|양자 알고리즘'})      # 차례와 되풀이만 다르다

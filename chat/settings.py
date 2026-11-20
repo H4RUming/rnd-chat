@@ -15,7 +15,7 @@ class Llm:
     base_url: str
     model: str
     api_key: str = ''
-    temperature: float = 0.3
+    temperature: float = 0.0
     max_tokens: int = 4096
     thinking: str = ''                   # 'on' | 'off' | ''(모델 기본). 생각하는 모델이 답하기 전에 따져 보게 할지
     timeout: float = 300.0
@@ -126,7 +126,7 @@ class Settings:
         users = tuple(entry for entry in config.get('users', []) if isinstance(entry, dict))
         return cls(
             llm=Llm(base_url=base_url, model=str(llm['model']).strip(), api_key=str(llm.get('api_key') or '').strip(),
-                    temperature=_number(llm, 'temperature', 0.3, 0.0, 2.0), max_tokens=int(_number(llm, 'max_tokens', 4096, 64, 65536)),
+                    temperature=_number(llm, 'temperature', 0.0, 0.0, 2.0), max_tokens=int(_number(llm, 'max_tokens', 4096, 64, 65536)),
                     timeout=_number(llm, 'timeout', 300.0, 5.0, 3600.0),
                     thinking={True: 'on', False: 'off'}[_flag(llm, 'thinking', True)] if 'thinking' in llm else ''),
             agent=Agent(max_steps=int(_number(agent, 'max_steps', 24, 1, 100)),
