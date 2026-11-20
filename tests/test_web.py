@@ -876,6 +876,50 @@ class WebTests(unittest.TestCase):
         self.assertEqual((park.get('/api/me').status_code, database.conversations().get('박연구'), [row[1] for row in database.sessions() if row[1] == '박연구']), (401, None, []))
         self.assertEqual(self.client().post('/login', data={'username': '박연구', 'password': 'correct horse'}, headers=ORIGIN).headers['location'], '/login?error=1')
 
+    def test_signup_mail_carries_the_steps_and_commands_and_the_terminal_command_registers_the_account(self):
+        import contextlib
+        from chat import accounts
+        folder = Path(tempfile.mkdtemp(prefix='rndchat-test-'))
+        self.addCleanup(shutil.rmtree, folder, True)
+        config = folder / 'config.toml'
+        config.write_text(f"""[llm]\nbase_url = "http://llm.test/v1"\nmodel = "hai"\n\n[[users]]\nname = "kim"\npassword_hash = "{HASH}"\nemail = "kim@example.org"\n
+[mail]\nusername = "bot@gmail.com"\npassword = "app-password"\n\n[briefing]\napp_url = "https://rnd.test"\n\n[signup]\nenabled = true\nadmin = "kim"\nnotify = "boss@example.org"\n""", encoding='utf-8')
+        settings = Settings.load(config)
+        self.assertEqual((settings.config, settings.signup.notify), (str(config), 'boss@example.org'))
+        self.sent = []
+        self.addCleanup(setattr, web.mailer, 'send', web.mailer.send)
+        web.mailer.send = lambda mail, to, subject, page, plain: self.sent.append((to, subject, page, plain))
+        self.app = web.create_app(settings, auth.Users(list(settings.users)), runner=lambda *args: None, throttle=self.throttle)
+        guest = self.client()
+        for name in ('박연구', 'choi'):
+            self.assertEqual(guest.post('/api/signup', json={'username': name, 'email': f'{name}@example.org', 'password': 'correct horse'}, headers=API).json(), {'ok': True})
+        to, subject, page, plain = self.sent[0]
+        self.assertEqual((to, subject), ('boss@example.org', '가입 신청: 박연구'))                 # [signup] notify 로 간다
+        command = f'-m chat.accounts --config {config} approve 박연구'
+        for part in ('화면에서 등록하기', 'kim 계정으로 로그인합니다.', '왼쪽 메뉴의 "계정"을 엽니다.', '서버 터미널에서 등록하기', command, f'--config {config} reject 박연구', '알아 둘 것'):
+            self.assertIn(part, plain)
+        self.assertTrue(command in page and '<pre' in page and '&quot;계정&quot;' in page and 'correct horse' not in page + plain)
+        # 메일에 적힌 명령으로 등록한다: 서버를 다시 띄우지 않아도 그 아이디로 로그인된다
+        refused = guest.post('/login', data={'username': '박연구', 'password': 'correct horse'}, headers=ORIGIN)
+        self.assertEqual(refused.headers['location'], '/login?error=1')
+
+        def run(*arguments):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = accounts.main(['--config', str(config), *arguments])
+            return code, out.getvalue() + err.getvalue()
+        code, listing = run('list')
+        self.assertTrue(code == 0 and '기다리는 신청 2건' in listing and '박연구  박연구@example.org' in listing and '등록된 계정 0건' in listing, listing)
+        code, said = run('approve', '박연구')
+        self.assertTrue(code == 0 and '등록했습니다' in said and '승인 메일을 보냈습니다: 박연구@example.org' in said, said)
+        self.assertEqual([(to, subject) for to, subject, _, _ in self.sent[2:]], [('박연구@example.org', '가입이 승인되었습니다')])
+        self.assertEqual(self.client('박연구', 'correct horse').get('/api/me').json()['name'], '박연구')
+        self.assertEqual((run('approve', '박연구')[0], run('approve', 'nobody')[0], run('reject', 'choi')[0], '기다리는 신청 0건' in run('list')[1]), (1, 1, 0, True))
+        self.assertEqual(guest.post('/login', data={'username': 'choi', 'password': 'correct horse'}, headers=ORIGIN).headers['location'], '/login?error=1')
+        database = storage.Database(folder / 'data' / 'chat.sqlite3')
+        database.add_account('kim', 'x@example.org', HASH, 1.0)                               # 설정의 계정과 이름이 겹치는 신청은 등록하지 않는다
+        self.assertEqual((run('approve', 'kim')[0], [account['status'] for account in database.accounts() if account['name'] == 'kim']), (1, ['pending']))
+
     def test_signup_requests_are_limited(self):
         self.signup_app(per_hour=4, max_pending=3)
         guest = self.client()

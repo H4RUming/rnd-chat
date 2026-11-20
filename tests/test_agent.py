@@ -130,6 +130,20 @@ class AgentTests(unittest.TestCase):
         self.assertIn('도구를 더 부르지 말고', llm.requests[-1][0][-1]['content'])
         outcome, _ = run(ScriptedLlm([{'content': '끊긴 답', 'finish_reason': 'length'}]), hub)
         self.assertEqual(outcome.stopped, 'length')
+        # 마무리하라는 말에 빈 답이 오면 한 번 더 묻고, 그래도 비면 빈 화면 대신 사정을 알린다
+        searching = [{'tool_calls': [call('search', {'page': page})]} for page in range(2)]
+        outcome, _ = run(ScriptedLlm(searching + [{'content': ''}, {'content': '두 번째에 나온 답'}]), hub, limits=Limits(max_steps=2))
+        self.assertEqual((outcome.answer, outcome.stopped), ('두 번째에 나온 답', 'max_steps'))
+        outcome, _ = run(ScriptedLlm(searching + [{'content': ''}, {'content': ' '}]), hub, limits=Limits(max_steps=2))
+        self.assertIn('답을 마무리하지 못했습니다', outcome.answer)
+        llm = ScriptedLlm(searching + [{'content': ''}, {'content': '다시 쓴 답'}])
+        run(llm, hub, limits=Limits(max_steps=2))
+        self.assertEqual((llm.requests[-1][0][-1]['content'], llm.thinking[-2:]), ('답이 비어 있습니다. 위에서 찾은 자료로 답을 지금 써 주세요.', [None, None]))
+        # 읽은 토큰이 한도를 넘으면 더 찾지 않고 답하게 한다(헤매는 실행이 수백만 토큰을 쓰지 않게)
+        heavy = [{'tool_calls': [call('search', {'page': page})]} for page in range(5)]      # 가짜 모델은 부를 때마다 10토큰을 읽었다고 한다
+        llm = ScriptedLlm(heavy[:2] + [{'content': '여기까지'}])
+        outcome, _ = run(llm, hub, limits=Limits(max_steps=12, turn_prompt_tokens=15))
+        self.assertEqual((outcome.answer, outcome.stopped, len(llm.requests), llm.requests[-1][1]), ('여기까지', 'max_steps', 3, None))
 
     def test_system_prompt_names_servers_and_outages(self):
         from datetime import date
@@ -300,12 +314,35 @@ class StuckTests(unittest.TestCase):
 
     def test_an_identical_call_is_answered_without_running_it_again(self):
         again = {'tool_calls': [call('search', {'q': 'ai', 'offset': 20})]}
-        llm = ScriptedLlm([again, {'tool_calls': [call('search', {'offset': 20, 'q': 'ai'})]}, again, {'content': '찾은 것까지만 답합니다'}])
+        llm = ScriptedLlm([again, {'tool_calls': [call('search', {'offset': 20, 'q': 'ai'})]}, {'content': '찾은 것으로 답합니다'}])
         hub = FakeHub({'search': tools.ToolResult('{"results": [], "total": 20}')})
         outcome, _ = run(llm, hub, limits=Limits(max_steps=12))
-        self.assertEqual((len(hub.calls), outcome.stopped, outcome.answer), (1, 'max_steps', '찾은 것까지만 답합니다'))   # 인자 순서만 다른 것도 같은 호출
-        self.assertIn('이미 조회했습니다', llm.requests[2][0][-1]['content'])
+        # 인자 순서만 다른 것도 같은 호출이다. 부른 것이 모두 이미 한 조회면 더 돌지 않고 바로 답하게 한다(상한에 걸린 것이 아니다)
+        self.assertEqual((len(hub.calls), outcome.stopped, outcome.steps, outcome.answer, len(llm.requests)), (1, '', 2, '찾은 것으로 답합니다', 3))
+        notice = llm.requests[2][0][-2]['content']
+        self.assertTrue('이 조회는 이미 끝났습니다' in notice and not notice.startswith('오류'), notice)
+        self.assertIn('필요한 조회는 이미 다 했습니다', llm.requests[2][0][-1]['content'])
         self.assertIsNone(llm.requests[-1][1])
+
+    def test_a_repeat_among_new_calls_goes_on_and_says_what_came_back_before(self):
+        empty = FakeHub({'search': tools.ToolResult('{"results": [], "total": 0}')})
+        first, other = call('search', {'q': '드론', 'region': '강원'}), call('search', {'q': '드론', 'region': '전국'})
+        llm = ScriptedLlm([{'tool_calls': [first]}, {'tool_calls': [first, other]}, {'content': '답'}])
+
+        class Local:                                                   # 화면용 요약(total)을 만들어 주는 쪽
+            def specs(self):
+                return []
+
+            async def call(self, name, arguments):
+                return None
+
+            def observe(self, name, arguments, text, is_error):
+                return text, {'total': json.loads(text)['total']}
+            sources = type('S', (), {'take_fresh': staticmethod(lambda: [])})()
+        outcome = asyncio.run(agent.run(llm, empty, [{'role': 'user', 'content': 'q'}], Limits(max_steps=12), None, Local()))
+        self.assertEqual((len(empty.calls), outcome.stopped, outcome.answer), (2, '', '답'))       # 새 조회가 섞여 있으면 이어 간다
+        told = [message['content'] for message in llm.requests[2][0] if message['role'] == 'tool'][1]
+        self.assertIn('그때 결과는 0건이었습니다: 이 조건에 맞는 자료가 없다는 뜻', told)
 
 
 class LlmClientTests(unittest.TestCase):

@@ -23,6 +23,7 @@ import logging
 from pathlib import Path
 import re
 import secrets
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -652,6 +653,22 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
     asked_by: dict[str, list[float]] = {}                    # 접속 주소별
     notify_to = signup.notify or next((str(entry.get('email') or '').strip() for entry in settings.users if entry.get('name') == signup.admin), '')
 
+    def account_commands(name: str) -> list[str]:
+        """이 서버에서 그 신청을 터미널로 승인·거절하는 명령(관리자에게 보내는 메일에 싣는다). 아이디는 가입할 때 글자를 가려 받아 그대로 써도 된다."""
+        root = Path(__file__).resolve().parent.parent
+        python = Path(sys.executable)
+        program = shlex.quote(str(python.relative_to(root)) if python.is_relative_to(root) else str(python))
+        elsewhere = f' --config {shlex.quote(settings.config)}' if settings.config and Path(settings.config) != root / 'config.toml' else ''
+        return [f'cd {shlex.quote(str(root))} && {program} -m chat.accounts{elsewhere} {action} {name}' for action in ('approve', 'reject')]
+
+    def adopt(name: str) -> None:
+        """터미널에서 승인한 계정(python -m chat.accounts approve)을, 그 사람이 로그인할 때 서버가 알아보게 한다."""
+        if database is None or users.taken(name):
+            return
+        account = next((entry for entry in database.accounts('active') if entry['name'] == name), None)
+        if account is not None and users.add(account['name'], account['password_hash']):
+            emails.setdefault(account['name'], account['email'])
+
     def notice_task(to: str, subject: str, page: str, plain: str) -> BackgroundTask | None:
         """알림 메일을 응답을 보낸 뒤에 보낸다. 못 보내도 신청·승인은 그대로다(화면에서 볼 수 있다)."""
         if not (to and settings.mail.username):
@@ -712,8 +729,15 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
         except sqlite3.IntegrityError:                       # 그사이 같은 아이디로 신청이 들어왔다
             return JSONResponse({'error': '이미 쓰이고 있는 아이디입니다.', 'field': 'username'}, status_code=409)
         log.info('signup asked name=%r ip=%s', name, ip)
-        page, plain = mailer.notice('가입 신청이 들어왔습니다', [('아이디', name), ('메일', email), ('신청한 때', time.strftime('%Y-%m-%d %H:%M', time.localtime(now)))],
-                                    f'{briefing.app_url}/?view=accounts' if briefing.app_url else '', '검토하러 가기')
+        approve, reject = account_commands(name)
+        page, plain = mailer.notice(
+            '가입 신청이 들어왔습니다', [('아이디', name), ('메일', email), ('신청한 때', time.strftime('%Y-%m-%d %H:%M', time.localtime(now)))],
+            f'{briefing.app_url}/?view=accounts' if briefing.app_url else '', '검토하러 가기',
+            guide=[('화면에서 등록하기', [f'{signup.admin} 계정으로 로그인합니다.', '왼쪽 메뉴의 "계정"을 엽니다.', f'"{name}" 줄에서 승인 또는 거절을 누릅니다.'], []),
+                   ('서버 터미널에서 등록하기', ['서버에 접속해 아래 명령을 그대로 실행합니다. 서버를 다시 띄울 필요는 없습니다.'], [approve, reject]),
+                   ('알아 둘 것', ['승인하면 그 아이디로 바로 로그인할 수 있고, 신청한 사람에게 승인 메일이 갑니다.',
+                                 '거절하면 신청이 지워지고, 신청한 사람에게는 알리지 않습니다.',
+                                 '이미 등록한 계정을 지우는 일은 화면의 "계정" 메뉴에서만 됩니다(그 계정의 대화와 문서도 함께 지워집니다).'], [])])
         return JSONResponse({'ok': True}, background=notice_task(notify_to, f'가입 신청: {name}', page, plain))
 
     async def accounts_api(request: Request) -> Response:
@@ -763,6 +787,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
         if throttle.locked_for(name) or ip_throttle.locked_for(ip):
             log.warning('login blocked (locked) name=%r ip=%s', name, ip)
             return RedirectResponse('/login?error=locked', status_code=303)
+        adopt(name)
         if not users.verify(name, password):
             throttle.failure(name)
             ip_throttle.failure(ip)

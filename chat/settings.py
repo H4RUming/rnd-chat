@@ -28,6 +28,7 @@ class Agent:
     sweep_max_items: int = 5000          # 전체 확인(review_all)이 한 번에 넘겨 보는 자료 수의 상한
     sweep_seconds: float = 600.0         # 전체 확인 한 번에 쓰는 시간의 상한
     turn_result_chars: int = 300000      # 질문 하나에서 모델에 넘기는 도구 결과의 합(모델이 한 번에 읽을 수 있는 양을 넘지 않게)
+    turn_prompt_tokens: int = 800000     # 질문 하나에 모델이 읽는 토큰의 합이 이만큼을 넘으면 더 찾지 않고 답하게 한다(헤매는 실행을 묶는다)
     max_images: int = 4
     thinking_steps: int = 1              # [llm] thinking 이 켜져 있을 때, 질문마다 앞의 몇 단계까지 속생각을 쓸지(0 이면 모든 단계)
     thinking_tokens: int = 4000          # 속생각을 쓰는 단계의 길이 상한(속생각 + 답). 넘으면 생각 없이 다시 묻는다
@@ -100,6 +101,7 @@ class Settings:
     mail: Mail = Mail()
     briefing: Briefing = Briefing()
     signup: Signup = Signup()
+    config: str = ''                     # 읽은 설정 파일의 경로(터미널 명령을 안내할 때 쓴다)
 
     @classmethod
     def load(cls, path: str | os.PathLike | None = None) -> 'Settings':
@@ -130,6 +132,7 @@ class Settings:
             agent=Agent(max_steps=int(_number(agent, 'max_steps', 24, 1, 100)),
                         tool_result_chars=int(_number(agent, 'tool_result_chars', 100000, 1000, 400000)),
                         turn_result_chars=int(_number(agent, 'turn_result_chars', 300000, 10000, 2000000)),
+                        turn_prompt_tokens=int(_number(agent, 'turn_prompt_tokens', 800000, 20000, 20000000)),
                         sweep_max_items=int(_number(agent, 'sweep_max_items', 5000, 100, 200000)),
                         sweep_seconds=_number(agent, 'sweep_seconds', 600.0, 10.0, 7200.0),
                         max_images=int(_number(agent, 'max_images', 4, 0, 16)),
@@ -145,7 +148,8 @@ class Settings:
             users=users,
             data_dir=str(appconfig.config_path(path).parent / 'data'),
             rhwp=_program(_table(config, 'documents'), 'rhwp', appconfig.config_path(path).parent),
-            mail=_mail(_table(config, 'mail')), briefing=_briefing(_table(config, 'briefing')), signup=_signup(_table(config, 'signup'), users))
+            mail=_mail(_table(config, 'mail')), briefing=_briefing(_table(config, 'briefing')), signup=_signup(_table(config, 'signup'), users),
+            config=str(appconfig.config_path(path)))
 
 
 def _clock(table: dict[str, Any], name: str, default: str) -> str:

@@ -132,7 +132,9 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
 
     failed: dict[tuple[str, str], int] = {}             # 같은 호출이 거듭 실패하는지 센다(같은 실수로 왕복을 다 쓰지 않게)
     done: dict[tuple[str, str], int] = {}               # 이미 결과를 받은 호출(같은 조건으로 다시 부르면 실행하지 않는다)
+    seen: dict[tuple[str, str], dict[str, Any]] = {}    # 그 호출이 돌려준 결과의 요약(되풀이해 부르면 무엇이 나왔었는지 다시 알려 준다)
     stuck = False
+    repeating = False                                   # 새로 찾는 것 없이 같은 조회만 되풀이해 마무리로 넘어갔는지
     spent = 0                                           # 이번 질문에서 모델에 넘긴 도구 결과의 글자 수
     # 속생각은 무엇을 어떻게 찾을지 정하는 앞 단계에서만 쓴다. 검색 결과 수만 자를 받은 뒤에도 켜 두면 답 하나에
     # 몇 분이 걸린다(실측: 속생각 3만 7천 토큰, 5분). 결과를 읽고 정리하는 단계는 생각 없이도 차이가 없었다.
@@ -148,6 +150,8 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
 
     for step in range(1, limits.max_steps + 1):
         if stuck:
+            break
+        if usage['prompt_tokens'] > limits.turn_prompt_tokens:      # 단계마다 앞의 결과를 모두 다시 읽는다: 헤매기 시작하면 금세 수백만 토큰이 된다
             break
         how = mode(step)
         reply = await llm.complete(messages, tools, **stream, **how)
@@ -172,7 +176,9 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
         if reply['content']:
             await emit({'type': 'reset'})                     # 도구를 부르기 전에 한 말은 답이 아니다
         images: list[tuple[str, str, str]] = []
+        new_calls = 0                                    # 이 차례에 처음 해 보는 호출의 수
         for call in calls:
+            repeated = False
             try:
                 arguments = parse_arguments(call['arguments'])
             except ValueError as exc:
@@ -185,7 +191,13 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                     # 같은 조건이면 같은 결과다: 다시 실행하지 않고 그렇게 알린다. 그래도 또 부르면 도구 없이 마무리하게 한다.
                     done[same] += 1
                     stuck = stuck or done[same] >= 3
-                    result = ToolResult('같은 조건으로 이미 조회했습니다(결과는 위에 있습니다). 조건을 바꾸거나, 지금까지 찾은 자료로 답하세요.', is_error=True)
+                    # 실측: 0건이 나온 검색을 믿지 않고 똑같이 두 번 더 부르다 끝나는 일이 잦았다. 그때 무엇이 나왔는지를 못 박아 준다.
+                    total = seen.get(same, {}).get('total')
+                    was = '' if not isinstance(total, int) else (
+                        ' 그때 결과는 0건이었습니다: 이 조건에 맞는 자료가 없다는 뜻이니 다시 불러도 같습니다.' if total == 0 else f' 그때 결과는 전체 {total}건이었습니다.')
+                    # 오류로 돌려주면("오류: …") 실패한 줄 알고 같은 호출을 다시 시도한다. 실패가 아니라 이미 끝난 일이라고 알린다.
+                    result = ToolResult(f'이 조회는 이미 끝났습니다(결과는 위에 그대로 있습니다).{was} 다시 부를 필요가 없습니다. 다른 조건으로 찾거나, 지금까지 찾은 자료로 답하세요.')
+                    repeated = True
                 elif call['name'] == sweep.NAME:
                     async def checked(done_so_far: int, total: int) -> None:
                         await emit({'type': 'tool_progress', 'name': sweep.NAME, 'checked': done_so_far, 'total': total})
@@ -206,8 +218,10 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                         fresh = local.sources.take_fresh()
                         if fresh:
                             await emit({'type': 'sources', 'sources': fresh})
-                if not result.is_error:
+                if not result.is_error and not repeated:
                     done[same] = 1
+                    seen[same] = result.summary or {}
+            new_calls += 0 if repeated else 1
             # 결과 하나의 상한과, 질문 하나에 넘기는 합의 상한(모델이 한 번에 읽을 수 있는 양을 넘으면 요청 자체가 실패한다)
             text = _clip(result.text, min(limits.tool_result_chars, max(2000, limits.turn_result_chars - spent)))
             spent += len(text)
@@ -224,6 +238,11 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                 await emit({'type': 'file', 'file': created})
             messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': text or '(빈 결과)'})
             images += [(call['name'], mime, data) for mime, data in result.images]
+        if not new_calls:
+            # 이 차례에 부른 것이 모두 이미 한 조회였다: 모델이 같은 차례를 되풀이하는 고리에 빠진 것이다(실측: 알림을 줘도 똑같이
+            # 다시 부른다). 한 번 더 돌려 봐야 그동안 받은 결과 전체를 다시 읽는 값만 치르므로, 바로 마무리하게 한다.
+            repeating = True
+            break
         if images and limits.max_images:
             # 도구 메시지에는 그림을 실을 수 없어, 바로 뒤에 사용자 차례로 그림을 붙인다
             shown = images[:limits.max_images]
@@ -233,13 +252,25 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
             messages.append({'role': 'user', 'content': [{'type': 'text', 'text': note}] + [
                 {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{data}'}} for _, mime, data in shown]})
     # 왕복 상한에 걸렸다: 도구 없이 지금까지 찾은 것으로 마무리하게 한다
-    messages.append({'role': 'user', 'content': '도구를 더 부르지 말고, 지금까지 찾은 내용만으로 답을 마무리하세요. 확인하지 못한 부분은 그렇다고 밝히세요.'})
-    reply = await llm.complete(messages, **stream, **({'thinking': False} if thinks and limits.thinking_steps else {}))
+    messages.append({'role': 'user', 'content': ('필요한 조회는 이미 다 했습니다. 도구를 더 부르지 말고, 위에서 찾은 자료로 답을 쓰세요. 답의 모양은 평소대로입니다(첫 문장에 확인한 건수와 맞는 건수, 그 아래 표).' if repeating else
+                                                 '도구를 더 부르지 말고, 지금까지 찾은 내용만으로 답을 마무리하세요. 확인하지 못한 부분은 그렇다고 밝히세요.')})
+    quiet = {'thinking': False} if thinks and limits.thinking_steps else {}
+    reply = await llm.complete(messages, **stream, **quiet)
     for key in usage:
         usage[key] += int(reply['usage'].get(key) or 0)
+    if not (reply['content'] or '').strip():
+        # 빈 답으로 끝나는 일이 있다(실측). 같은 말로 다시 물으면 또 비므로, 비었다고 알리고 이번에는 생각하고 쓰게 한다.
+        # 그래도 비면 빈 화면 대신 사정을 알린다.
+        reply = await llm.complete(messages + [{'role': 'user', 'content': '답이 비어 있습니다. 위에서 찾은 자료로 답을 지금 써 주세요.'}], **stream)
+        for key in usage:
+            usage[key] += int(reply['usage'].get(key) or 0)
+        if not (reply['content'] or '').strip():
+            reply['content'] = '찾은 자료로 답을 마무리하지 못했습니다. 질문을 조금 좁혀 다시 물어봐 주세요.'
     messages.append({'role': 'assistant', 'content': reply['content']})
-    await emit({'type': 'answer', 'text': reply['content'], 'stopped': 'max_steps'})
-    return Outcome(reply['content'], messages, limits.max_steps, 'max_steps', usage)
+    # 되풀이로 넘어온 것은 상한에 걸린 것이 아니다: 찾을 것을 다 찾고 마무리한 보통의 답이다
+    stopped = '' if repeating else 'max_steps'
+    await emit({'type': 'answer', 'text': reply['content'], 'stopped': stopped})
+    return Outcome(reply['content'], messages, step if repeating else limits.max_steps, stopped, usage)
 
 
 def _clip(text: str, limit: int) -> str:

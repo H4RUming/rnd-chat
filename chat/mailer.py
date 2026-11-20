@@ -71,16 +71,27 @@ def render(markdown: str, sources: list[dict[str, Any]], title: str, link: str =
     return page, plain
 
 
-def notice(title: str, rows: list[tuple[str, str]], link: str = '', link_label: str = '') -> tuple[str, str]:
-    """짧은 알림 메일(가입 신청, 승인). rows: (이름표, 값). 값은 사람이 넣은 글이라 모두 이스케이프한다."""
+def notice(title: str, rows: list[tuple[str, str]], link: str = '', link_label: str = '',
+           guide: list[tuple[str, list[str], list[str]]] | None = None) -> tuple[str, str]:
+    """짧은 알림 메일(가입 신청, 승인). rows: (이름표, 값). 값은 사람이 넣은 글이라 모두 이스케이프한다.
+    guide: 그 아래에 붙이는 안내 — (제목, 차례대로 할 일들, 그대로 쓸 명령들)의 목록. 명령은 고정폭 글로 한 줄씩 싣는다."""
     lines = ''.join(f'<tr><td style="padding:5px 18px 5px 0;color:{_SOFT};white-space:nowrap">{html.escape(label)}</td>'
                     f'<td style="padding:5px 0">{html.escape(value)}</td></tr>' for label, value in rows)
     button = (f'<p style="margin:24px 0 0"><a href="{html.escape(link)}" style="display:inline-block;padding:10px 18px;border-radius:20px;'
               f'background:{_ACCENT};color:#ffffff;text-decoration:none;font-size:14px">{html.escape(link_label or link)}</a></p>') if link else ''
+    help_page, help_plain = '', ''
+    for heading, steps, commands in guide or []:
+        help_page += f'<h3 style="margin:26px 0 6px;font-size:14px;color:{_INK}">{html.escape(heading)}</h3>'
+        if steps:
+            help_page += '<ol style="margin:0;padding-left:20px;line-height:1.7">' + ''.join(f'<li>{html.escape(step)}</li>' for step in steps) + '</ol>'
+        for command in commands:
+            help_page += (f'<pre style="margin:8px 0 0;padding:10px 12px;border:1px solid {_LINE};border-radius:8px;background:#f6f6f8;'
+                          f'font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;word-break:break-all">{html.escape(command)}</pre>')
+        help_plain += f'\n\n{heading}\n' + '\n'.join([*(f'{number}. {step}' for number, step in enumerate(steps, 1)), *(f'  {command}' for command in commands)])
     page = (f'<div style="{_FONT};color:{_INK};font-size:14px;max-width:560px;margin:0 auto;padding:8px 4px">'
             f'<h2 style="margin:0 0 14px;font-size:20px">{html.escape(title)}</h2>'
-            f'<table cellspacing="0" cellpadding="0" style="border-collapse:collapse">{lines}</table>{button}</div>')
-    plain = title + '\n\n' + '\n'.join(f'{label}: {value}' for label, value in rows) + (f'\n\n{link}' if link else '')
+            f'<table cellspacing="0" cellpadding="0" style="border-collapse:collapse">{lines}</table>{button}{help_page}</div>')
+    plain = title + '\n\n' + '\n'.join(f'{label}: {value}' for label, value in rows) + (f'\n\n{link}' if link else '') + help_plain
     return page, plain
 
 
