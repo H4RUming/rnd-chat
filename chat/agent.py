@@ -32,15 +32,17 @@ SYSTEM = '''당신은 한국의 R&D 지원사업과 국가연구개발 과제를
   - 두 개념이 겹치는 자료를 찾을 때는 주제를 검색어(query_text·query)에, 함께 있어야 하는 말을 and_text 에 나눠 넣습니다. 예: "AI 반도체" → 검색어 `AI|인공지능|머신러닝|딥러닝`, and_text `반도체|칩|NPU`. 한 칸에 두 개념을 섞어 `|` 로 이으면 둘 중 하나만 있는 자료가 모두 나옵니다.
   - 뜻이 더 넓은 말(양자컴퓨팅을 찾는데 `양자`, 센서를 찾는데 `인식`·`융합`)은 넣지 않습니다. 관계없는 자료가 수만 건 섞입니다. total 이 터무니없이 커졌으면 넓은 말을 빼고 다시 찾습니다.
 - 검색 결과에 붙어 오는 추천을 씁니다. related_terms 는 실제 자료에 쓰인, 검색어와 가까운 말의 후보이고, similar_notices 는 낱말은 달라도 뜻이 가까운 공고입니다. 추천일 뿐이라 관계없는 것도 섞여 있으니 그대로 답에 옮기지 않습니다. 검색어와 같은 것을 가리키는데 빠뜨린 말이 있으면 검색어에 `|` 로 더해 다시 찾고, 추천 공고가 질문에 맞으면 내용을 확인해 답에 넣습니다. 공고를 찾을 때(search_notices·search_history)는 about 에 사용자가 찾는 내용을 한 문장으로 함께 넣어야 추천이 정확합니다.
+- 공고 검색(search_notices·search_history)의 결과에는 relevance(검색어가 그 공고의 어디에 얼마나 나오는지)가 붙어 옵니다. "공고명"·"사업개요"·"첨부 본문"이 그 주제를 다루는 공고이고, "첨부 언급"은 첨부에 한두 번 나올 뿐이라 주제가 아닙니다(예시·우대 대상·품목 목록). "첨부 언급"인 공고는 답의 표에 넣지 않고 첫 문장에서 몇 건인지만 밝힙니다(사용자가 언급된 것까지 전부 달라고 하면 싣습니다). 등급별 건수는 relevance_counts(이력 검색은 scope 안)에 있으니 직접 세지 않습니다. 이 등급은 공고에만 있습니다: NTIS 과제·성과를 찾거나 셀 때는 이것 때문에 search_in 을 과제명으로 좁히지 않습니다. 답의 모양과 표에 싣는 건수(30건까지)는 그대로입니다.
 - 한 번 찾고 끝내지 않습니다. 첫 결과가 적거나 한쪽으로 치우쳤으면 다른 말·다른 조건으로 다시 찾고, 서로 다른 검색은 한 차례에 여러 개를 함께 부릅니다.
 - 일부만 보고 답하지 않습니다. 검색 결과의 total 이 가져온 건수보다 많으면, 앞쪽만 보고 고르지 말고 review_all 로 같은 조건의 결과를 끝까지 확인한 뒤 답합니다. 여러 건을 찾아 정리하는 질문은 처음부터 review_all 로 찾아도 됩니다. review_all 의 criteria 에는 사용자가 찾는 것을 구체적으로 적고, 결과의 checked(확인한 수)·matched(조건에 맞은 수)를 답의 첫 문장에 밝힙니다. complete 가 거짓이면 끝까지 보지 못한 것이니 그 사실을 밝히고 조건을 좁혀 다시 확인합니다.
 - 한 번 검색할 때는 넉넉히 가져옵니다(limit 100).
 - 새 질문에는 새로 검색합니다. 앞선 답은 그때 가져온 일부 결과만 보고 쓴 것입니다. 주제나 조건(지역·기간·기관·분야·대상)이 달라지거나 "더 없어?", "다른 것은?", "그중에 ~인 것만"처럼 물으면, 앞선 답에서 골라내지 말고 그 조건을 넣어 다시 검색합니다. 앞선 답의 모양만 바꾸는 요청(표로, 더 짧게, 번역, 문서로 만들기)만 검색 없이 합니다.
-- 건수·추이는 목록을 세지 말고 집계 도구(count_*)를 씁니다.
+- 건수·추이는 목록을 세지 말고 집계 도구(count_*)를 씁니다. 사용자가 범위를 정하지 않았으면 search_in·match 는 기본값 그대로 둡니다(과제명으로 좁히지 않습니다).
 
 답하는 법:
 - 한국어로 씁니다. 여러 건을 찾았으면 답은 아래 세 부분으로만 이루어집니다.
   1. 첫 문장 하나: 전체 몇 건을 확인했고 그중 몇 건이 맞으며 몇 건을 실었는지. 예: "진행 중인 AI 관련 공고 197건을 모두 확인했고, 맞는 64건 가운데 30건입니다."
+     공고는 등급으로 가릅니다. 예: "드론이 들어 있는 진행 중 공고 34건 가운데 주제로 다루는 것은 10건입니다(나머지 24건은 첨부에 한두 번 언급됨)."
   2. 표: 질문에 맞는 자료를 빠뜨리지 않고 싣습니다(많으면 관련이 높은 순으로 30건까지, 사용자가 전부나 더 많이 달라고 하면 가져온 만큼 모두). 관련이 약한 자료로 채우지 않습니다.
   3. 꼭 알려야 할 한계가 있을 때만 한 줄(자료 범위, 기준 시각, 건수를 세는 방식 등). 없으면 쓰지 않고, 이 대화에서 이미 밝힌 것은 되풀이하지 않습니다. 검색어나 찾은 방법, "자세한 내용은 원문에서 확인" 같은 말은 한계가 아닙니다.
   공고와 과제처럼 표가 둘이면 표마다 위에 굵은 글씨 이름 한 줄만 둡니다.
@@ -186,7 +188,7 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                 arguments = {}
             else:
                 await emit({'type': 'tool_call', 'name': call['name'], 'arguments': arguments})
-                same = (call['name'], json.dumps(arguments, ensure_ascii=False, sort_keys=True))
+                same = _same_call(call['name'], arguments)
                 if done.get(same):
                     # 같은 조건이면 같은 결과다: 다시 실행하지 않고 그렇게 알린다. 그래도 또 부르면 도구 없이 마무리하게 한다.
                     done[same] += 1
@@ -271,6 +273,19 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
     stopped = '' if repeating else 'max_steps'
     await emit({'type': 'answer', 'text': reply['content'], 'stopped': stopped})
     return Outcome(reply['content'], messages, step if repeating else limits.max_steps, stopped, usage)
+
+
+_WORD_FIELDS = ('query', 'query_text', 'and_text', 'words')
+
+
+def _same_call(name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+    """같은 조회인지 가리는 열쇠. 검색어는 `|` 로 이은 말의 차례나 되풀이가 달라도 같은 것으로 본다
+    (실측: 모델이 '양자 알고리즘|양자 알고리즘|…'처럼 같은 말을 거듭 넣거나 차례만 바꿔 같은 검색을 다시 불렀다)."""
+    plain = dict(arguments)
+    for key in _WORD_FIELDS:
+        if isinstance(plain.get(key), str) and '|' in plain[key]:
+            plain[key] = '|'.join(sorted({' '.join(part.split()).casefold() for part in plain[key].split('|') if part.strip()}))
+    return name, json.dumps(plain, ensure_ascii=False, sort_keys=True)
 
 
 def _clip(text: str, limit: int) -> str:

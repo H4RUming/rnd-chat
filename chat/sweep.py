@@ -22,10 +22,11 @@ BATCH_CHARS = 30000              # 한 번에 모델에 보여 고르게 하는 
 MAX_RETURNED = 150               # 대화로 돌려주는 맞는 자료의 수(그보다 많으면 건수만 알린다)
 _KEYS = ('title', 'notice_id', 'project_number', 'result_id', 'report_id', 'url', 'project_url', 'year', 'category', 'region', 'ministry', 'agency',
          'implementing_agency', 'organization', 'program', 'manager', 'application_start', 'application_end', 'posted_at', 'status',
-         'total_period', 'government_funds_text', 'keywords', 'journal', 'authors', 'publisher', 'applicant', 'matched_in')
+         'total_period', 'government_funds_text', 'keywords', 'journal', 'authors', 'publisher', 'applicant', 'matched_in', 'relevance', 'mentions')
 _TEXT_KEYS = ('snippet', 'summary')
 _HIDDEN = ('notice_id', 'project_number', 'result_id', 'report_id', 'url', 'project_url')      # 고를 때는 보이지 않아도 되는 값
-_PASS_ON = ('related_terms', 'related_terms_note', 'similar_notices', 'similar_notices_note', 'note', 'matched_all_terms')
+_PASS_ON = ('related_terms', 'related_terms_note', 'similar_notices', 'similar_notices_note', 'note', 'matched_all_terms',
+            'relevance_counts', 'relevance_note')
 
 SPEC = {'type': 'function', 'function': {
     'name': NAME,
@@ -204,5 +205,9 @@ async def review_all(llm: Any, hub: Any, arguments: dict[str, Any], max_items: i
     for key in _PASS_ON:                                 # 첫 쪽에 붙어 온 추천·주의는 그대로 전한다
         if key in first:
             answer[key] = first[key]
+    scope = first.get('scope') if isinstance(first.get('scope'), dict) else {}
+    for key in ('relevance_counts', 'relevance_note'):   # 이력 검색은 등급별 건수를 scope 안에 둔다
+        if key in scope and key not in answer:
+            answer[key] = scope[key]
     summary = {'total': answer['total'], 'checked': checked, 'matched': len(kept)}
     return ToolResult(json.dumps(answer, ensure_ascii=False, separators=(',', ':')), summary=summary)

@@ -324,6 +324,14 @@ class StuckTests(unittest.TestCase):
         self.assertIn('필요한 조회는 이미 다 했습니다', llm.requests[2][0][-1]['content'])
         self.assertIsNone(llm.requests[-1][1])
 
+    def test_the_same_words_in_another_order_or_repeated_are_the_same_search(self):
+        first = call('search', {'query_text': '양자컴퓨팅|양자 알고리즘|큐비트', 'limit': 100})
+        again = call('search', {'limit': 100, 'query_text': '큐비트|양자 알고리즘|양자  알고리즘|양자컴퓨팅|양자 알고리즘'})      # 차례와 되풀이만 다르다
+        other = call('search', {'query_text': '양자컴퓨팅|양자 알고리즘|큐비트|양자센서', 'limit': 100})              # 말이 하나 더 있다: 다른 검색이다
+        hub = FakeHub({'search': tools.ToolResult('{"results": [], "total": 3}')})
+        outcome, _ = run(ScriptedLlm([{'tool_calls': [first]}, {'tool_calls': [other]}, {'tool_calls': [again]}, {'content': '답'}]), hub, limits=Limits(max_steps=12))
+        self.assertEqual((len(hub.calls), outcome.stopped, outcome.answer), (2, '', '답'))
+
     def test_a_repeat_among_new_calls_goes_on_and_says_what_came_back_before(self):
         empty = FakeHub({'search': tools.ToolResult('{"results": [], "total": 0}')})
         first, other = call('search', {'q': '드론', 'region': '강원'}), call('search', {'q': '드론', 'region': '전국'})
