@@ -249,6 +249,7 @@ class Conversations:
 
 
 FILE_FIELDS = ('id', 'name', 'kind', 'size', 'created', 'origin', 'pages', 'applied', 'failed')     # 문서 목록에 싣는 것
+ATTACHABLE = ('pdf', 'hwp', 'hwpx', 'docx')      # 질문에 붙일 수 있는 문서
 _MARKUP = re.compile(r'[*#|`>\[\]]+|-{3,}')           # 검색 결과에 붙이는 글에서는 마크다운 기호를 뺀다
 
 
@@ -894,7 +895,8 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             attached = []
             for file_id in wanted:
                 found = store.get(session.user, file_id)
-                if found is None or found[0].get('origin') != 'upload':
+                # 올린 문서뿐 아니라 만들거나 고친 문서도 붙일 수 있다(문서 목록의 "이 문서 고치기"). 제 계정의 것만 찾아지므로 남의 파일은 붙지 않는다
+                if found is None or found[0].get('kind') not in ATTACHABLE:
                     return JSONResponse({'error': '첨부한 파일을 찾을 수 없습니다. 다시 올려 주세요.'}, status_code=400)
                 attached.append(found[0])
         if session.busy:
@@ -1065,6 +1067,10 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             entry = {key: meta[key] for key in FILE_FIELDS if key in meta}
             if meta['id'] in where:
                 entry['conversation'] = where[meta['id']]
+            entry['editable'] = meta['kind'] in editing.EDITABLE
+            root = store.get(session.user, meta['root']) if meta.get('root') else None
+            if root is not None:                         # 고친 문서: 원본도 받을 수 있게 그 이름을 함께 준다
+                entry.update(root=meta['root'], root_name=root[0]['name'])
             listed.append(entry)
         return JSONResponse({'files': listed, 'bytes': sum(int(entry.get('size') or 0) for entry in listed)})
 

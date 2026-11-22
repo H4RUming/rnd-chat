@@ -212,24 +212,32 @@ class WebTests(unittest.TestCase):
     def test_search_conditions_are_kept_per_account_and_told_to_the_model(self):
         kim, lee = self.client('kim'), self.client('lee', 'plain-password')
         me = kim.get('/api/me').json()
-        self.assertEqual(me['conditions'], {'region': '', 'applicant': '', 'closed': False})
+        self.assertEqual(me['conditions'], {'region': '', 'nationwide': True, 'applicant': '', 'closed': False})      # 전국은 처음부터 켜져 있다
         self.assertTrue('강원' in me['choices']['regions'] and '개인사업자' in me['choices']['applicants'])
         self.ask(kim, '지원사업 알려줘')
         self.assertNotIn('검색 조건', self.local.system_note)                 # 고른 것이 없으면 모델에 아무 말도 덧붙이지 않는다
         saved = kim.post('/api/conditions', json={'region': '강원', 'applicant': '개인사업자', 'closed': False, 'extra': 1}, headers=API)
-        self.assertEqual(saved.json()['conditions'], {'region': '강원', 'applicant': '개인사업자', 'closed': False})
+        self.assertEqual(saved.json()['conditions'], {'region': '강원', 'nationwide': True, 'applicant': '개인사업자', 'closed': False})
         self.assertEqual(kim.get('/api/me').json()['conditions']['region'], '강원')
         self.assertEqual(lee.get('/api/me').json()['conditions']['region'], '')       # 다른 계정의 것은 그대로다
         self.ask(kim, '지원사업 알려줘')
         system = self.local.system_note
-        for expected in ('- 지역: 강원', '- 신청 주체: 개인사업자', '"내 조건 기준"', '지금 접수 중인 공고만', '(조건: 강원 · 개인사업자 · 접수 중)', '질문이 우선'):
+        for expected in ('- 지역: 강원과 전국', 'region 에 "강원,전국"', '- 신청 주체: 개인사업자', '"내 조건 기준"', '지금 접수 중인 공고만',
+                         '(조건: 강원·전국 · 개인사업자 · 접수 중)', '질문이 우선'):
             self.assertIn(expected, system)
+        # 전국은 지역을 고른 뒤에만 끌 수 있다: 끄면 그 지역 공고만 찾는다
+        only = kim.post('/api/conditions', json={'region': '강원', 'nationwide': False}, headers=API).json()['conditions']
+        self.assertEqual((only['region'], only['nationwide']), ('강원', False))
+        self.ask(kim, '지원사업 알려줘')
+        self.assertIn('- 지역: 강원만', self.local.system_note)
+        self.assertIn('(조건: 강원 · 접수 중)', self.local.system_note)
+        self.assertEqual(kim.post('/api/conditions', json={'nationwide': False}, headers=API).json()['conditions']['nationwide'], True)
         # 고를 수 없는 값은 버리고, 마감 포함만 켜도 조건으로 알린다
         self.assertEqual(kim.post('/api/conditions', json={'region': '화성', 'applicant': ['x'], 'closed': True}, headers=API).json()['conditions'],
-                         {'region': '', 'applicant': '', 'closed': True})
+                         {'region': '', 'nationwide': True, 'applicant': '', 'closed': True})
         self.ask(kim, '지원사업 알려줘')
         self.assertIn('마감된 공고까지 포함', self.local.system_note)
-        self.assertNotIn('- 지역', self.local.system_note)
+        self.assertIn('- 지역: 전국(지역을 가리지 않고', self.local.system_note)
         self.assertEqual(kim.post('/api/conditions', content=b'{', headers=API).status_code, 400)
         self.assertEqual(kim.post('/api/conditions', json={}, headers=ORIGIN).status_code, 403)       # 바꾸는 요청은 화면에서 온 것만 받는다
         self.app = web.create_app(self.settings, self.users, runner=self.runner, throttle=self.throttle)      # 서버를 다시 띄워도 남아 있다
@@ -547,6 +555,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual((again['name'], again['root'], again['previous']), ('신청서.docx', meta['id'], edited['id']))
         info = kim.get(f'/api/files/{again["id"]}/info').json()                 # 미리보기에서 원본을 보는 중에는 원본을 제 이름으로 내려받는다
         self.assertEqual((info['root'], info['root_name']), (meta['id'], '신청서 양식.docx'))
+        listed = {entry['id']: entry for entry in kim.get('/api/files').json()['files']}
+        self.assertEqual((listed[again['id']]['root'], listed[again['id']]['root_name'], listed[again['id']]['editable']), (meta['id'], '신청서 양식.docx', True))
+        self.assertNotIn('root', listed[meta['id']])
         self.assertIn(f'[이 답에서 만든 파일: 신청서.docx (file_id: {edited["id"]})]', self.calls[-1][1]['content'])    # 앞선 답의 파일을 모델이 다시 가리킬 수 있다
         # 미리보기: 파일 정보와 쪽 그림
         info = kim.get(f'/api/files/{again["id"]}/info').json()
@@ -565,6 +576,12 @@ class WebTests(unittest.TestCase):
             self.assertTrue(result.is_error and expected in result.text and not result.files, result.text)
         inspected = asyncio.run(self.local.call('inspect_document', {'file_id': again['id'], 'table': 0, 'pages': [1, 7]}))
         self.assertTrue('c1 "김가온"' in inspected.text and len(inspected.images) == 1, inspected.text)
+        # 문서 목록의 "이 문서 고치기": 고친 문서를 새 대화에 붙여 보낼 수 있다(예전에는 올린 문서만 붙었다)
+        self.make = None
+        response = kim.post('/api/chat', json={'message': '직위도 채워줘', 'attachments': [again['id']]}, headers=API)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(f'file_id: {again["id"]}', self.calls[-1][-1]['content'][0]['text'])
+        self.assertEqual(kim.post('/api/chat', json={'message': 'x', 'attachments': ['없는-파일']}, headers=API).status_code, 400)
 
     def test_conversations_and_files_survive_a_restart(self):
         kim = self.client('kim')

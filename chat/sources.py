@@ -104,6 +104,7 @@ class Sources:
         self._unnumbered = 0                             # 꽉 차서 번호를 주지 못한 자료 수(도구 결과 하나 안에서)
         self._shown: set[int] = set()                    # 이번 질문의 검색 결과로 이미 자세히 넘긴 번호
         self._repeats = 0                                # 그래서 짧게 줄여 넘긴 자료 수(도구 결과 하나 안에서)
+        self.last_new: int | None = None                 # 방금 본 검색 결과가 이번 질문에서 처음 가져온 자료의 수(검색이 아니면 None)
 
     def register(self, url: str, title: str, item: dict[str, Any] | None = None, tool: str = '') -> int:
         """주소에 번호를 준다(이미 있으면 그 번호). 꽉 찼으면 0."""
@@ -136,6 +137,7 @@ class Sources:
 
     def observe(self, tool: str, arguments: dict[str, Any], text: str, is_error: bool) -> tuple[str, dict[str, Any]]:
         """도구 결과를 보고 출처를 등록한다. 돌려주는 것: (번호를 적어 넣은 결과 글, 화면용 요약)."""
+        self.last_new = None
         if is_error:
             return text, {'error': ' '.join(text.split())[:300]}
         try:
@@ -164,6 +166,7 @@ class Sources:
             # 실측: 번호를 못 받은 모델이 공고 번호를 [111253] 처럼 지어 적어 링크가 사라졌다
             data['cite_note'] = (f'출처 번호가 다 차서 {self._unnumbered}건에는 cite 가 없습니다. 그 자료를 답에 쓸 때는 번호를 지어내지 말고 '
                                  '그 자료의 url 을 [원문](주소) 모양의 링크로 적으세요.')
+        self.last_new = len(found) + self._unnumbered - self._repeats if tool.startswith('search_') else None
         if self._repeats and isinstance(data, dict):
             data['seen_before_note'] = (f'seen_before 가 참인 {self._repeats}건은 이번 질문의 앞선 검색 결과에 같은 cite 번호로 자세히 실려 있어 '
                                         '여기서는 이름만 실었습니다.')

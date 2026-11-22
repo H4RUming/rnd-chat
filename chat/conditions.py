@@ -13,16 +13,28 @@ CHOICES = {'regions': list(REGIONS), 'applicants': list(APPLICANTS)}
 
 
 def clean(raw: Any) -> dict[str, Any]:
-    """받은 값을 고를 수 있는 것으로만 남긴다. region·applicant 가 빈 글이면 고르지 않은 것, closed 는 마감된 공고까지 볼지."""
+    """받은 값을 고를 수 있는 것으로만 남긴다. region·applicant 가 빈 글이면 고르지 않은 것, closed 는 마감된 공고까지 볼지.
+
+    nationwide 는 지역 제한이 없는 전국 대상 공고도 함께 찾을지다. 처음부터 켜져 있고(어느 지역 기업이든 전국 공고에는 신청할 수
+    있다), 지역을 고른 뒤에만 끌 수 있다: 지역도 없고 전국도 아니면 찾을 것이 없다.
+    """
     raw = raw if isinstance(raw, dict) else {}
-    return {'region': raw.get('region') if raw.get('region') in REGIONS else '',
+    region = raw.get('region') if raw.get('region') in REGIONS else ''
+    return {'region': region, 'nationwide': raw.get('nationwide') is not False or not region,
             'applicant': raw.get('applicant') if raw.get('applicant') in APPLICANTS else '',
             'closed': raw.get('closed') is True}
 
 
+def where(conditions: dict[str, Any]) -> str:
+    """지역 조건을 적는 말: 전국 | 강원·전국 | 강원."""
+    if not conditions['region']:
+        return '전국'
+    return conditions['region'] + ('·전국' if conditions['nationwide'] else '')
+
+
 def label(conditions: dict[str, Any]) -> str:
-    """화면과 답에 적는 한 줄. 예: 강원 · 개인사업자 · 접수 중"""
-    return ' · '.join(part for part in (conditions['region'], conditions['applicant'], '마감 포함' if conditions['closed'] else '접수 중') if part)
+    """화면과 답에 적는 한 줄. 예: 강원·전국 · 개인사업자 · 접수 중"""
+    return ' · '.join(part for part in (where(conditions), conditions['applicant'], '마감 포함' if conditions['closed'] else '접수 중') if part)
 
 
 def note(raw: Any) -> str:
@@ -31,8 +43,15 @@ def note(raw: Any) -> str:
     if not (conditions['region'] or conditions['applicant'] or conditions['closed']):
         return ''
     lines = []
-    if conditions['region']:
-        lines.append(f'- 지역: {conditions["region"]}. 공고를 찾을 때 region 에 넣습니다(그 지역 소재 기업이 대상인 공고). 전국 대상 공고는 사용자가 원할 때 따로 찾습니다.')
+    if conditions['region'] and conditions['nationwide']:
+        lines.append(f'- 지역: {conditions["region"]}과 전국. {conditions["region"]} 소재 기업이 신청할 수 있는 공고를 찾습니다: 공고 검색의 region 에 '
+                     f'"{conditions["region"]},전국"을 넣어 {conditions["region"]} 지역 공고와 지역 제한이 없는 전국 대상 공고를 함께 찾습니다. '
+                     f'표에 "지역" 칸을 두어 {conditions["region"]} 공고와 전국 공고를 구분하고 {conditions["region"]} 공고를 먼저 싣습니다. '
+                     '첫 문장에는 둘이 각각 몇 건인지 밝힙니다.')
+    elif conditions['region']:
+        lines.append(f'- 지역: {conditions["region"]}만. 공고 검색의 region 에 "{conditions["region"]}"을 넣습니다(그 지역 공고만, 전국 대상 공고는 빼고).')
+    else:
+        lines.append('- 지역: 전국(지역을 가리지 않고 찾습니다).')
     if conditions['applicant']:
         lines.append(f'- 신청 주체: {conditions["applicant"]}. 공고를 표로 정리할 때 "신청 주체(공고문)" 칸에 공고문이 정한 신청 주체를 그 표기대로 적고, '
                      f'"내 조건 기준" 칸에 {conditions["applicant"]}가 신청할 수 있는지를 가능 / 불가 / 확인 필요 가운데 하나로 적습니다. '

@@ -541,8 +541,8 @@ function addActions(view) {
   });
   view.actions.replaceChildren(copy);
   if (state.conversation && view.index !== null) {
-    view.actions.append(exportLink(view, 'docx', 'file', '워드 문서로 저장'));
-    if (hasTable(view.text)) view.actions.append(exportLink(view, 'xlsx', 'sheet', '표를 엑셀로 저장'));
+    view.actions.append(exportLink(view, 'docx', 'file', '답을 워드 문서로 내보내기'));
+    if (hasTable(view.text)) view.actions.append(exportLink(view, 'xlsx', 'sheet', '답의 표를 엑셀로 내보내기'));
   }
   for (const old of $('thread').querySelectorAll('.regenerate')) old.remove();     // 다시 생성은 마지막 답에만
   const made = (state.kind === 'brief' && view.index === 1) || view.auto;      // 브리핑 글 자체는 다시 생성하지 않는다(브리핑 화면의 지금 받기로 새로 만든다)
@@ -691,46 +691,53 @@ function propose(question) {                               // 예시를 누르�
 }
 
 // ── 검색 조건(지역·신청 주체·접수 상태): 입력창 아래 한 줄. 계정에 저장되고 공고를 찾는 질문마다 적용된다 ──
-function renderFilters() {
+function renderFilters(open) {                             // open: 다시 그린 뒤에도 열어 둘 창(지역은 전국과 시도를 이어서 고른다)
   const box = $('filters'), now = state.conditions, choices = state.choices;
   if (!now || !choices) return box.replaceChildren();
+  const one = (key) => (value, name) => ({name, on: now[key] === value, pick: () => setCondition({[key]: value})});
   const groups = [
-    {key: 'region', title: '지역', label: now.region || '지역', set: Boolean(now.region), options: [['', '전체'], ...choices.regions.map((name) => [name, name])]},
-    {key: 'applicant', title: '신청 주체', label: now.applicant || '신청 주체', set: Boolean(now.applicant), options: [['', '전체'], ...choices.applicants.map((name) => [name, name])]},
-    {key: 'closed', title: '접수 상태', label: now.closed ? '마감 포함' : '접수 중', set: true, options: [[false, '접수 중'], [true, '마감 포함']]},
+    // 전국(지역 제한이 없는 공고)은 처음부터 켜져 있다. 시도를 고르면 그 지역 공고와 전국 공고를 함께 찾고, 전국은 그때 끌 수 있다
+    {key: 'region', title: '지역', label: now.region ? now.region + (now.nationwide ? '·전국' : '') : '전국', set: true, options: [
+      {name: '전국', on: now.nationwide, pick: () => { if (now.region) setCondition({nationwide: !now.nationwide}, 'region'); }},
+      ...choices.regions.map((name) => ({name, on: now.region === name,
+                                         pick: () => setCondition(now.region === name ? {region: '', nationwide: true} : {region: name}, 'region')}))]},
+    {key: 'applicant', title: '신청 주체', label: now.applicant || '신청 주체', set: Boolean(now.applicant),
+     options: [one('applicant')('', '전체'), ...choices.applicants.map((name) => one('applicant')(name, name))]},
+    {key: 'closed', title: '접수 상태', label: now.closed ? '마감 포함' : '접수 중', set: true, options: [one('closed')(false, '접수 중'), one('closed')(true, '마감 포함')]},
   ];
   box.replaceChildren();
   for (const group of groups) {
     const button = el('button', {type: 'button', class: 'filter' + (group.set ? ' set' : ''), 'aria-haspopup': 'true', 'aria-expanded': 'false', 'aria-label': `${group.title}: ${group.label}`},
                       el('span', {text: group.label}), icon('chevron'));
     const menu = el('div', {class: 'menu filter-menu', role: 'menu'}, el('p', {class: 'menu-title', text: group.title}),
-                    el('div', {class: 'choices'}, ...group.options.map(([value, name]) => {
-                      const on = now[group.key] === value;
-                      const option = el('button', {type: 'button', 'aria-pressed': String(on)}, on ? icon('check') : '', el('span', {text: name}));
-                      option.addEventListener('click', () => setCondition(group.key, value));
+                    el('div', {class: 'choices'}, ...group.options.map((choice) => {
+                      const option = el('button', {type: 'button', 'aria-pressed': String(choice.on)}, choice.on ? icon('check') : '', el('span', {text: choice.name}));
+                      option.addEventListener('click', choice.pick);
                       return option;
                     })));
     menu.hidden = true;
     bindMenu(button, menu);
-    button.addEventListener('click', () => {               // 연 다음에 자리를 잡는다: 단추 아래(첫 화면) 또는 입력창 위(대화 중), 줄 밖으로 나가지 않게
-      if (menu.hidden) return;
+    const place = () => {                                  // 단추 아래(첫 화면) 또는 입력창 위(대화 중)에, 줄 밖으로 나가지 않게
       menu.style.left = Math.max(0, Math.min(button.offsetLeft, box.clientWidth - menu.offsetWidth)) + 'px';
       menu.style.bottom = document.body.classList.contains('empty') ? '' : (box.offsetHeight + $('composer').offsetHeight + 12) + 'px';
-    });
+    };
+    button.addEventListener('click', () => { if (!menu.hidden) place(); });
     box.append(button, menu);
+    if (open === group.key) { menu.hidden = false; button.setAttribute('aria-expanded', 'true'); place(); }
   }
 }
 
-async function setCondition(key, value) {
+async function setCondition(changes, open) {
   const before = state.conditions;
-  state.conditions = {...before, [key]: value};
-  renderFilters();
+  state.conditions = {...before, ...changes};
+  renderFilters(open);
+  const stillOpen = () => (open && !$('filters').querySelector('.filter-menu:not([hidden])') ? undefined : open);      // 그사이 닫았으면 다시 열지 않는다
   // 저장이 끝나야 다음 질문에 적용된다: 보내기는 이것을 기다린다
-  state.saving = api('/api/conditions', {method: 'POST', headers: API_HEADERS, body: JSON.stringify(state.conditions)})
-    .then(async (response) => { if (!response.ok) throw new Error('save'); state.conditions = (await response.json()).conditions; })
-    .catch((error) => { if (error.message !== 'login') state.conditions = before; })
-    .finally(() => { state.saving = null; renderFilters(); });
-  await state.saving;
+  const saving = state.saving = api('/api/conditions', {method: 'POST', headers: API_HEADERS, body: JSON.stringify(state.conditions)})
+    .then(async (response) => { if (!response.ok) throw new Error('save'); if (state.saving === saving) state.conditions = (await response.json()).conditions; })
+    .catch((error) => { if (error.message !== 'login' && state.saving === saving) state.conditions = before; })
+    .finally(() => { if (state.saving === saving) { state.saving = null; renderFilters(stillOpen()); } });
+  await saving;
 }
 
 function updateSend() {
@@ -1501,7 +1508,26 @@ async function openDocs(page) {
         if (made) made.scrollIntoView({block: 'center'});
       }));
     }
-    actions.append(el('a', {class: 'icon', href: fileUrl(file), download: file.name, title: '내려받기', 'aria-label': '내려받기'}, icon('download')),
+    if (file.editable) {                                    // 이 문서가 붙은 새 대화를 연다: 파일 이름을 다시 적지 않고 고칠 내용만 말하면 된다
+      actions.append(iconButton('edit', '이 문서 고치기', () => {
+        if (state.busy) return;
+        newConversation();
+        state.attachments = [file];
+        renderAttachments();
+        $('input').placeholder = '어떻게 고칠지 말해 주세요';
+      }));
+    }
+    if (file.root) {                                        // 고친 문서: 수정본과 원본 가운데 무엇을 받을지 글로 고른다
+      const pick = iconButton('download', '내려받기', () => {});
+      const menu = el('div', {class: 'menu down'},
+                      el('a', {href: fileUrl(file), download: file.name}, icon('download'), el('span', {text: '수정본 내려받기'})),
+                      el('a', {href: fileUrl({id: file.root}), download: file.root_name || ''}, icon('file'), el('span', {text: '원본 내려받기'})));
+      menu.hidden = true;
+      bindMenu(pick, menu);
+      menu.addEventListener('click', () => { menu.hidden = true; pick.setAttribute('aria-expanded', 'false'); });
+      actions.append(el('span', {class: 'pick'}, pick, menu));
+    } else actions.append(el('a', {class: 'icon', href: fileUrl(file), download: file.name, title: '내려받기', 'aria-label': '내려받기'}, icon('download')));
+    actions.append(
                    iconButton('trash', '문서 지우기', async () => {
                      if (!confirm(`"${file.name}" 문서를 지울까요?`)) return;
                      const response = await api(fileUrl(file), {method: 'DELETE', headers: API_HEADERS});

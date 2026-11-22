@@ -489,6 +489,63 @@ class FeedbackTests(unittest.TestCase):
         again = json.loads(later.observe('search_history', {}, json.dumps({'total': 1, 'results': [hit(2)]}, ensure_ascii=False), False)[0])
         self.assertEqual((again['results'][0]['cite'], 'snippet' in again['results'][0]), (2, True))
 
+    def reworded(self, steps, found):
+        """검색을 한 번에 하나씩(또는 여럿) 부르는 모델과, 낱말에 따라 공고를 돌려주는 자료 서버로 돌려 본다."""
+        from chat.sources import Sources
+
+        class Local:                                     # 출처 번호를 매기는 쪽(웹 서버가 붙이는 것과 같은 일)
+            def __init__(self):
+                self.sources = Sources()
+
+            def specs(self):
+                return []
+
+            async def call(self, name, arguments):
+                return None
+
+            def observe(self, tool, arguments, text, is_error):
+                return self.sources.observe(tool, arguments, text, is_error)
+
+        def search(arguments):
+            numbers = found(arguments)
+            return tools.ToolResult(json.dumps({'total': len(numbers), 'results': [{'title': f'공고 {n}', 'notice_id': f'PBLN_{n:012d}'} for n in numbers]}, ensure_ascii=False))
+        hub = FakeHub({'search_history': search})
+        llm = ScriptedLlm([{'tool_calls': [call('search_history', arguments, f'c{step}-{n}') for n, arguments in enumerate(group)]} for step, group in enumerate(steps)]
+                          + [{'content': '답'}, {'content': '답'}])
+        messages = [{'role': 'system', 'content': 'S'}, {'role': 'user', 'content': '질문'}]
+        outcome = asyncio.run(agent.run(llm, hub, messages, Limits(), None, Local()))
+        return outcome, hub, [message['content'] for message in outcome.messages if message['role'] == 'tool']
+
+    def test_searches_that_only_change_the_words_and_find_nothing_new_are_stopped(self):
+        base = {'query_text': 'RISE', 'region': '강원', 'deadline_from': '2025-01-01'}
+        steps = [[base]] + [[{**base, 'and_text': word, 'match': 'full'}] for word in ('기업', '과제', '대학', '연구', '개발')]
+        outcome, hub, sent = self.reworded(steps, lambda arguments: [1, 2])              # 무엇을 덧붙여도 같은 두 건이 나온다
+        self.assertEqual(len(hub.calls), 4)                                               # 첫 검색 + 낱말만 바꾼 세 번까지만 실제로 찾는다
+        self.assertIn('3번째 새 자료 없이 끝났습니다', sent[3])
+        self.assertIn('이 검색은 실행하지 않았습니다', sent[4])
+        self.assertEqual((outcome.answer, outcome.stopped), ('답', ''))                    # 막힌 호출뿐인 차례가 오면 찾기를 끝내고 답한다
+
+    def test_other_topics_other_filters_and_fruitful_widening_are_not_stopped(self):
+        region = {'region': '강원'}
+        # 서로 다른 주제를 하나씩 찾아 모두 0건: 낱말이 겹치지 않으니 되풀이가 아니다
+        topics = [[{**region, 'query_text': word} for word in ('드론', '수소', '양자', '메타버스', '로봇')]]
+        self.assertEqual(len(self.reworded(topics, lambda arguments: [])[1].calls), 5)
+        # 넓힐 때마다 새 공고가 나오면 계속 찾는다
+        more = ['무인기', 'UAV', '멀티콥터', '무인항공기', '비행체']
+        widening = [[{**region, 'query_text': '|'.join(['드론'] + more[:n])}] for n in range(6)]
+        self.assertEqual(len(self.reworded(widening, lambda arguments: [arguments['query_text'].count('|') + 1])[1].calls), 6)
+        # 새 자료가 한 번 나오면 다시 센다
+        streak = [[{**region, 'query_text': '드론', 'and_text': word}] for word in ('가', '나', '다', '라', '마', '바')]
+        found = lambda arguments: [1, 2] if arguments['and_text'] == '다' else [1]          # 첫 검색과 세 번째만 새 공고를 가져온다
+        self.assertEqual(len(self.reworded(streak, found)[1].calls), 6)                    # 가(새) 나(없음) 다(새) 라·마·바(없음 1·2·3)
+        # 막힌 조건의 검색은 실행하지 않아도, 함께 부른 다른 지역의 검색은 한다
+        moved = [[{**region, 'query_text': '드론', 'and_text': word}] for word in ('가', '나', '다')]
+        moved += [[{**region, 'query_text': '드론', 'and_text': '라'}, {'region': '경기', 'query_text': '드론', 'and_text': '마'}]]
+        _, hub, sent = self.reworded(moved, lambda arguments: [])
+        self.assertEqual([arguments.get('region') for _, arguments in hub.calls], ['강원', '강원', '강원', '경기'])
+        self.assertIn('실행하지 않았습니다', sent[3])
+        self.assertNotIn('실행하지 않았습니다', sent[4])
+
     def test_sources_past_the_limit_get_a_link_instead_of_an_invented_number(self):
         from chat.sources import Sources
         sources = Sources(limit=2)
