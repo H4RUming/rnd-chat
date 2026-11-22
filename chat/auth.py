@@ -139,9 +139,15 @@ class Session:
     user: str
     created: float
     seen: float
-    busy: bool = False                               # 질문 하나를 처리하는 중인지
+    task: Any = None                                 # 지금 답을 만들고 있는 일(asyncio.Task). 끝나면 다음 질문을 받는다
     data: dict[str, Any] = field(default_factory=dict)
     stamp: str = ''                                  # 로그인할 때의 비밀번호 표식(Users.stamp)
+
+    @property
+    def busy(self) -> bool:
+        """질문 하나를 처리하는 중인지. 깃발을 따로 두지 않고 일 자체를 본다: 연결이 어떻게 끊기든 일이 끝나면 풀린다
+        (예전에는 응답을 흘려보내기 전에 연결이 끊기면 깃발이 내려가지 않아, 그 로그인으로는 질문이 계속 거절됐다)."""
+        return self.task is not None and not self.task.done()
 
 
 def _key(token: str) -> str:

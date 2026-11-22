@@ -399,8 +399,35 @@ function conversationRow(item) {
   return row;
 }
 
+// ── 쓰던 글(초안): 대화마다 이 브라우저에 남겨, 새로고침하거나 다른 대화를 다녀와도 되살린다 ──
+const draftKey = (id = state.conversation) => `draft:${state.name}:${id || 'new'}`;
+function saveDraft() {
+  try {
+    const text = $('input').value;
+    if (text.trim()) localStorage.setItem(draftKey(), text.slice(0, state.limit)); else localStorage.removeItem(draftKey());
+  } catch { /* 저장 못 해도 쓰는 데는 지장이 없다 */ }
+}
+function loadDraft() {
+  let text = '';
+  try { text = localStorage.getItem(draftKey()) || ''; } catch { /* 무시 */ }
+  const input = $('input');
+  input.value = text;
+  input.style.height = '';
+  if (text) input.style.height = Math.min(input.scrollHeight, 220) + 'px';
+  updateSend();
+}
+function forgetDrafts(keep) {                               // keep: 남길 대화 번호들(없으면 이 계정의 초안을 모두 지운다)
+  try {
+    const mine = `draft:${state.name}:`;
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith(mine) && !(keep && (key === mine + 'new' || keep.has(key.slice(mine.length))))) localStorage.removeItem(key);
+    }
+  } catch { /* 무시 */ }
+}
+
 async function loadList() {
   state.conversations = (await (await api('/api/conversations')).json()).conversations;
+  forgetDrafts(new Set(state.conversations.map((item) => item.id)));      // 지운 대화의 초안은 남기지 않는다
   renderList();
 }
 
@@ -608,6 +635,7 @@ async function openConversation(id) {
   if (!response.ok) return loadList();
   const item = await response.json();
   state.conversation = item.id;
+  loadDraft();
   state.kind = item.kind || '';
   state.view = null;
   document.body.classList.remove('paged');
@@ -632,6 +660,7 @@ async function openConversation(id) {
 function newConversation() {
   if (state.busy) return;
   state.conversation = null;
+  loadDraft();
   state.kind = '';
   state.view = null;
   document.body.classList.remove('paged');
@@ -651,6 +680,57 @@ function setBusy(busy) {
   $('send').title = busy ? '중단' : '보내기';
   $('send').classList.toggle('stop', busy);
   updateSend();
+}
+
+function propose(question) {                               // 예시를 누르면 바로 보내지 않고 입력창에 채운다(조건을 보고 고친 뒤 보내게)
+  const input = $('input');
+  input.value = question;
+  input.dispatchEvent(new Event('input'));
+  input.focus();
+  input.setSelectionRange(question.length, question.length);
+}
+
+// ── 검색 조건(지역·신청 주체·접수 상태): 입력창 아래 한 줄. 계정에 저장되고 공고를 찾는 질문마다 적용된다 ──
+function renderFilters() {
+  const box = $('filters'), now = state.conditions, choices = state.choices;
+  if (!now || !choices) return box.replaceChildren();
+  const groups = [
+    {key: 'region', title: '지역', label: now.region || '지역', set: Boolean(now.region), options: [['', '전체'], ...choices.regions.map((name) => [name, name])]},
+    {key: 'applicant', title: '신청 주체', label: now.applicant || '신청 주체', set: Boolean(now.applicant), options: [['', '전체'], ...choices.applicants.map((name) => [name, name])]},
+    {key: 'closed', title: '접수 상태', label: now.closed ? '마감 포함' : '접수 중', set: true, options: [[false, '접수 중'], [true, '마감 포함']]},
+  ];
+  box.replaceChildren();
+  for (const group of groups) {
+    const button = el('button', {type: 'button', class: 'filter' + (group.set ? ' set' : ''), 'aria-haspopup': 'true', 'aria-expanded': 'false', 'aria-label': `${group.title}: ${group.label}`},
+                      el('span', {text: group.label}), icon('chevron'));
+    const menu = el('div', {class: 'menu filter-menu', role: 'menu'}, el('p', {class: 'menu-title', text: group.title}),
+                    el('div', {class: 'choices'}, ...group.options.map(([value, name]) => {
+                      const on = now[group.key] === value;
+                      const option = el('button', {type: 'button', 'aria-pressed': String(on)}, on ? icon('check') : '', el('span', {text: name}));
+                      option.addEventListener('click', () => setCondition(group.key, value));
+                      return option;
+                    })));
+    menu.hidden = true;
+    bindMenu(button, menu);
+    button.addEventListener('click', () => {               // 연 다음에 자리를 잡는다: 단추 아래(첫 화면) 또는 입력창 위(대화 중), 줄 밖으로 나가지 않게
+      if (menu.hidden) return;
+      menu.style.left = Math.max(0, Math.min(button.offsetLeft, box.clientWidth - menu.offsetWidth)) + 'px';
+      menu.style.bottom = document.body.classList.contains('empty') ? '' : (box.offsetHeight + $('composer').offsetHeight + 12) + 'px';
+    });
+    box.append(button, menu);
+  }
+}
+
+async function setCondition(key, value) {
+  const before = state.conditions;
+  state.conditions = {...before, [key]: value};
+  renderFilters();
+  // 저장이 끝나야 다음 질문에 적용된다: 보내기는 이것을 기다린다
+  state.saving = api('/api/conditions', {method: 'POST', headers: API_HEADERS, body: JSON.stringify(state.conditions)})
+    .then(async (response) => { if (!response.ok) throw new Error('save'); state.conditions = (await response.json()).conditions; })
+    .catch((error) => { if (error.message !== 'login') state.conditions = before; })
+    .finally(() => { state.saving = null; renderFilters(); });
+  await state.saving;
 }
 
 function updateSend() {
@@ -680,6 +760,7 @@ async function ask(question) {
 
 async function run(payload) {
   setBusy(true);
+  if (state.saving) await state.saving;                     // 방금 바꾼 조건이 저장된 뒤에 보낸다
   const view = addAssistant();
   view.node.classList.add('pending');
   const started = performance.now(), clock = el('span', {class: 'clock'});
@@ -694,12 +775,17 @@ async function run(payload) {
     view.body.replaceChildren(markdown(buffer));
     if (stick) scrollDown(true);
   };
+  const again = () => {                                     // 저장되지 않은 질문을 같은 내용으로 다시 보낸다
+    const button = el('button', {type: 'button', class: 'pill retry'}, icon('refresh'), el('span', {text: '다시 시도'}));
+    button.addEventListener('click', () => { if (state.busy) return; view.node.remove(); run(payload); });
+    return button;
+  };
   const fail = (message) => {
     finished = true;
     finishSteps(view, true);
     view.node.classList.remove('pending');
     view.node.classList.add('failed');
-    view.body.replaceChildren(buffer ? markdown(buffer) : '', el('p', {class: 'error'}, icon('alert'), message));
+    view.body.replaceChildren(buffer ? markdown(buffer) : '', el('p', {class: 'error'}, icon('alert'), message), again());
   };
   state.controller = new AbortController();
   try {
@@ -717,7 +803,11 @@ async function run(payload) {
         pending = pending.slice(cut + 2);
         if (!chunk.startsWith('data: ')) continue;
         const event = JSON.parse(chunk.slice(6));
-        if (event.type === 'queued') view.body.replaceChildren(el('p', {class: 'thinking'}, el('span', {class: 'spinner'}), '앞선 질문을 처리하는 중이라 잠시 기다립니다'));
+        if (event.type === 'queued') {
+          const cancel = el('button', {type: 'button', class: 'pill retry'}, icon('x'), el('span', {text: '취소'}));
+          cancel.addEventListener('click', () => { if (state.controller) state.controller.abort(); });
+          view.body.replaceChildren(el('p', {class: 'thinking'}, el('span', {class: 'spinner'}), '다른 질문을 처리하고 있어 차례를 기다립니다', clock), cancel);
+        }
         else if (event.type === 'delta') {
           buffer += event.text;
           if (!scheduled) { scheduled = true; requestAnimationFrame(paint); }
@@ -755,7 +845,11 @@ async function run(payload) {
           view.meta.textContent = metaText((performance.now() - started) / 1000, calls);
           if (stick) scrollDown(true);
         } else if (event.type === 'done') {
-          state.conversation = event.conversation_id;
+          if (state.conversation !== event.conversation_id) {      // 새 대화에 번호가 붙었다: 답을 기다리며 쓰던 글을 그 대화의 초안으로 옮긴다
+            try { localStorage.removeItem(draftKey()); } catch { /* 무시 */ }
+            state.conversation = event.conversation_id;
+            saveDraft();
+          }
           view.index = event.index;
           setTitle(event.title);
           addActions(view);
@@ -768,7 +862,7 @@ async function run(payload) {
       finished = true;
       finishSteps(view, true);
       view.node.classList.remove('pending');
-      view.body.replaceChildren(buffer ? markdown(buffer) : '', el('p', {class: 'note', text: '답을 중단했습니다. 이 질문은 대화에 저장되지 않았습니다.'}));
+      view.body.replaceChildren(buffer ? markdown(buffer) : '', el('p', {class: 'note', text: '답을 중단했습니다. 이 질문은 대화에 저장되지 않았습니다.'}), again());
     } else if (error.message !== 'login') fail('연결이 끊겼습니다. 다시 시도해 주세요.');
   } finally {
     clearInterval(ticking);
@@ -901,13 +995,21 @@ function fillPages() {
   $('viewerpage').textContent = `${currentPage()} / ${viewing.pages}`;
 }
 
+function aimDownload() {                                  // 내려받기는 지금 보고 있는 쪽을 준다(원본을 보는 중이면 원본)
+  const file = viewing.file, link = $('viewerdownload');
+  if (!file) return;
+  const original = Boolean(viewing.original && file.root);
+  link.href = original ? fileUrl({id: file.root}) : fileUrl(file);
+  link.setAttribute('download', original ? (file.root_name || '') : file.name);
+  link.lastElementChild.textContent = file.root ? (original ? '원본 내려받기' : '수정본 내려받기') : '내려받기';
+}
+
 async function openViewer(file) {
   const dialog = $('viewer'), box = $('viewerpages');
   viewing.file = file; viewing.pages = 0; viewing.original = false;
   $('viewername').textContent = file.name;
   $('viewerinfo').textContent = '불러오는 중';
-  $('viewerdownload').href = fileUrl(file);
-  $('viewerdownload').setAttribute('download', file.name);
+  aimDownload();
   for (const id of ['viewercompare', 'viewerchanges', 'viewerside', 'viewerpager']) $(id).hidden = true;
   box.replaceChildren(el('p', {class: 'notice'}, el('span', {class: 'spinner'})));
   if (!dialog.open) dialog.showModal();
@@ -921,7 +1023,9 @@ async function openViewer(file) {
     box.replaceChildren(el('p', {class: 'notice', text: (info.error || info.preview_error || '쪽 모양을 그리지 못했습니다.') + ' 내려받아 확인해 주세요.'}));
     return;
   }
+  delete file.root; delete file.root_name;                  // 그사이 원본을 지웠으면 견줄 것이 없다
   viewing.file = Object.assign(file, info);
+  aimDownload();
   viewing.pages = Math.min(info.pages, 60);
   $('viewerinfo').textContent = [KIND[info.kind] || info.kind, `${info.pages}쪽`, size(info.size)].join(' · ') + (info.pages > 60 ? ' · 앞 60쪽만 표시' : '');
   $('viewerpager').hidden = false;
@@ -952,6 +1056,7 @@ function bindViewer() {
     viewing.original = !viewing.original;
     $('viewercompare').setAttribute('aria-pressed', String(viewing.original));
     $('viewercompare').lastElementChild.textContent = viewing.original ? '원본 보는 중' : '원본 보기';
+    aimDownload();
     fillPages();
   });
   $('viewerchanges').addEventListener('click', () => {
@@ -1012,6 +1117,7 @@ $('composer').addEventListener('submit', (event) => {
   if (!question.trim() || question.trim().length > state.limit) return;
   input.value = '';
   input.style.height = '';
+  saveDraft();
   updateSend();
   ask(question);
 });
@@ -1021,6 +1127,7 @@ $('input').addEventListener('keydown', (event) => {
 $('input').addEventListener('input', (event) => {
   event.target.style.height = '';
   event.target.style.height = Math.min(event.target.scrollHeight, 220) + 'px';
+  saveDraft();
   updateSend();
 });
 $('attach').addEventListener('click', () => $('file').click());
@@ -1048,12 +1155,13 @@ $('backdrop').addEventListener('click', closeSidebarOnMobile);
 $('tobottom').addEventListener('click', () => scrollDown(true));
 $('scroll').addEventListener('scroll', () => { $('tobottom').hidden = nearBottom(); });
 for (const button of document.querySelectorAll('.suggestions button')) {
-  button.addEventListener('click', () => { if (button.dataset.action === 'attach') $('file').click(); else ask(button.dataset.q); });
+  button.addEventListener('click', () => { if (button.dataset.action === 'attach') $('file').click(); else propose(button.dataset.q); });
   if (button.dataset.action === 'attach') {              // 양식 알약에 올리면 입력창의 첨부 단추가 움직여, 같은 일을 하는 곳을 알려 준다
     for (const [name, on] of [['pointerenter', true], ['focus', true], ['pointerleave', false], ['blur', false]]) button.addEventListener(name, () => $('attach').classList.toggle('nudge', on));
   }
 }
 bindMenu($('user'), $('usermenu'));
+document.querySelector('form[action="/logout"]').addEventListener('submit', () => forgetDrafts());      // 함께 쓰는 컴퓨터에 쓰던 글을 남기지 않는다
 $('status').addEventListener('click', () => setView(state.view === 'tools' ? null : 'tools'));
 $('nav-desk').addEventListener('click', () => openDesk().catch(() => {}));
 $('tab-talk').addEventListener('click', () => { setView(null); watchDesk().catch(() => {}); });
@@ -1083,6 +1191,9 @@ async function loadStatus() {
   const me = await (await api('/api/me')).json();
   state.name = me.name;
   state.limit = me.max_question_chars;
+  state.conditions = me.conditions || null;
+  state.choices = me.choices || null;
+  renderFilters();
   $('who').textContent = me.name;
   $('initial').textContent = me.name.slice(0, 1).toUpperCase();
   const down = me.servers.filter((server) => !server.ok).length;
@@ -1509,7 +1620,7 @@ async function openAccounts(page) {
       if (new URLSearchParams(location.search).get('view') === 'accounts') { history.replaceState(null, '', '/'); setView('accounts'); }      // 알림 메일의 링크
     }
     await loadList();
-    updateSend();
+    loadDraft();
     $('input').focus();
   } catch { /* 로그인 화면으로 넘어가는 중 */ }
 })();

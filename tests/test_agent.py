@@ -394,6 +394,118 @@ class StuckTests(unittest.TestCase):
         self.assertIn('그때 결과는 0건이었습니다: 이 조건에 맞는 자료가 없다는 뜻', told)
 
 
+class FeedbackTests(unittest.TestCase):
+    """2026-11-22 검증에서 드러난 것: 건수와 표가 어긋남, 최근 해로 치우침, 출처 번호가 다 참."""
+
+    def table(self, rows):
+        return '| 공고명 | 마감 |\n|---|---|\n' + '\n'.join(f'| 공고 {n} | 2026-12-{n % 28 + 1:02d} |' for n in range(rows))
+
+    def test_first_sentence_is_rewritten_when_it_disagrees_with_the_table(self):
+        answer = '공고 663건을 모두 확인했고, 맞는 233건 가운데 30건을 싣습니다.\n\n**강원**\n\n' + self.table(30) + '\n\n**전국**\n\n' + self.table(6)
+        self.assertEqual(agent._count_gap(answer), (36, [30, 6]))
+        llm = ScriptedLlm([{'content': answer}, {'content': '공고 663건을 모두 확인했고, 맞는 233건 가운데 36건을 싣습니다(강원 30건, 전국 6건).'}])
+        heard = []
+        outcome, _ = run(llm, FakeHub({}), listener=heard.append)
+        self.assertTrue(outcome.answer.startswith('공고 663건을 모두 확인했고, 맞는 233건 가운데 36건을 싣습니다'))
+        self.assertEqual(agent._table_rows(outcome.answer), [30, 6])           # 표는 그대로
+        self.assertIn('모두 36건', llm.requests[1][0][-1]['content'])
+        self.assertEqual((llm.streamed[1], llm.thinking[1]), (False, False))     # 고치는 물음은 화면에 흘리지 않는다
+        self.assertEqual([event['text'] for event in heard if event['type'] == 'answer'], [outcome.answer])
+
+    def test_the_answer_is_kept_when_the_count_agrees_or_the_fix_is_unusable(self):
+        agreeing = '공고 64건 가운데 12건입니다.\n\n' + self.table(12)
+        checklist = '공고 352건을 확인했고 해당 공고는 0건입니다.\n\n' + self.table(4)      # 줄이 적은 표는 목록이 아니다
+        for text in (agreeing, checklist, '설명만 있는 답입니다.'):
+            with self.subTest(text=text[:12]):
+                self.assertIsNone(agent._count_gap(text))
+                llm = ScriptedLlm([{'content': text}])
+                self.assertEqual(run(llm, FakeHub({}))[0].answer, text)
+        wrong = '공고 66건을 확인했고 맞는 것은 12건입니다.\n\n' + self.table(29)
+        for reply in ('', '맞는 것은 12건입니다.', '| 표를 | 다시 |'):           # 빈 답, 여전히 틀린 답, 표를 다시 쓴 답
+            with self.subTest(reply=reply):
+                self.assertEqual(run(ScriptedLlm([{'content': wrong}, {'content': reply}]), FakeHub({}))[0].answer, wrong)
+
+    def test_matches_over_several_years_are_counted_by_year_and_returned_evenly(self):
+        from chat import sweep
+        records = [{'title': f'공고 {n}', 'notice_id': f'PBLN_{n:012d}', 'application_end': ('2026-11-30' if n < 220 else '2025-06-30')} for n in range(300)]
+
+        def search(arguments):
+            page = records[arguments['offset']:arguments['offset'] + arguments['limit']]
+            following = arguments['offset'] + len(page)
+            return tools.ToolResult(json.dumps({'total': 300, 'results': page, 'next_offset': following if following < 300 else None}, ensure_ascii=False))
+
+        class Everything:
+            async def complete(self, messages, tools=None, on_text=None, thinking=None, max_tokens=None):
+                count = int(messages[1]['content'].split('자료 ')[1].split('건')[0])
+                return {'content': json.dumps(list(range(1, count + 1))), 'tool_calls': [], 'finish_reason': 'stop', 'usage': {}}
+        answer = json.loads(asyncio.run(sweep.review_all(Everything(), FakeHub({'search_history': search}),
+                                                         {'tool': 'search_history', 'arguments': {}, 'criteria': '전부'})).text)
+        self.assertEqual((answer['matched'], answer['matched_by_year']), (300, {'2025': 80, '2026': 220}))
+        years = [item['application_end'][:4] for item in answer['items']]
+        self.assertEqual((years.count('2025'), years.count('2026')), (75, 75))      # 검색 순서로 앞의 150건이면 2025년은 0건이었다
+        self.assertEqual(years, sorted(years, reverse=True))                         # 검색 순서(최근 먼저)는 그대로
+        self.assertIn('해마다 고르게', answer['caution'])
+        few = sweep.spread([(n, {'application_end': f'{2024 + n % 3}-01-01'}) for n in range(9)], 4)
+        self.assertEqual([order for order, _ in few], [0, 1, 2, 5])                  # 최근 해부터 번갈아 한 건씩, 남는 자리는 다시 최근 해
+
+    def test_searches_leave_room_for_the_documents_read_afterwards(self):
+        hub = FakeHub({'search_history': tools.ToolResult('검' * 6000), 'get_history_requirements': tools.ToolResult('요' * 5000)})
+        llm = ScriptedLlm([{'tool_calls': [call('search_history', {'query_text': word}, word) for word in '가나다']},
+                           {'tool_calls': [call('get_history_requirements', {'notice_ids': ['PBLN_000000000000001']}, 'r')]},
+                           {'content': '답'}])
+        run(llm, hub, limits=Limits(turn_result_chars=20000, tool_result_chars=10000))
+        sent = {message['tool_call_id']: message['content'] for message in llm.requests[-1][0] if message['role'] == 'tool'}
+        self.assertEqual([sent[word].count('검') for word in '가나다'], [6000, 6000, 2000])     # 검색은 몫(65%)까지만: 세 번째는 바닥값으로 잘린다
+        self.assertEqual(sent['r'], '요' * 5000)                                              # 검색이 다 썼다면 2,000자로 잘려 들어갔을 것이다
+
+    def test_opening_notices_one_at_a_time_is_pointed_to_the_batch_tool(self):
+        hub = FakeHub({'get_history_notice': lambda arguments: tools.ToolResult('{"title": "공고"}'), 'get_history_requirements': tools.ToolResult('{}')})
+        llm = ScriptedLlm([{'tool_calls': [call('get_history_notice', {'notice_id': f'PBLN_00000000000000{n}'}, f'c{n}') for n in range(1, 5)]}, {'content': '답'}])
+        run(llm, hub)
+        sent = [message['content'] for message in llm.requests[-1][0] if message['role'] == 'tool']
+        self.assertEqual(['get_history_requirements' in text for text in sent], [False, False, True, False])     # 세 번째에 한 번만 알린다
+        alone = FakeHub({'get_history_notice': lambda arguments: tools.ToolResult('{"title": "공고"}')})          # 묶어 받는 도구가 없으면 알리지 않는다
+        llm = ScriptedLlm([{'tool_calls': [call('get_history_notice', {'notice_id': f'PBLN_00000000000000{n}'}, f'c{n}') for n in range(1, 5)]}, {'content': '답'}])
+        run(llm, alone)
+        self.assertFalse(any('한 건씩' in message['content'] for message in llm.requests[-1][0] if message['role'] == 'tool'))
+
+    def test_a_hit_already_sent_this_turn_comes_back_short(self):
+        from chat.sources import Sources
+        sources = Sources()
+        hit = lambda n: {'title': f'공고 {n}', 'notice_id': f'PBLN_00000000011125{n}', 'snippet': '개요 ' * 30, 'relevance': '공고명',
+                         'attachment_hits': [{'document_id': 'FILE_1', 'name': '공고문.pdf', 'snippet': '대목 ' * 30}]}
+        first = json.loads(sources.observe('search_history', {}, json.dumps({'total': 2, 'results': [hit(1), hit(2)]}, ensure_ascii=False), False)[0])
+        self.assertTrue(all('snippet' in item for item in first['results']) and 'seen_before_note' not in first)
+        text, summary = sources.observe('search_history', {}, json.dumps({'total': 2, 'results': [hit(2), hit(3)]}, ensure_ascii=False), False)
+        second = json.loads(text)
+        self.assertEqual(second['results'][0], {'cite': 2, 'notice_id': 'PBLN_000000000111252', 'title': '공고 2', 'relevance': '공고명', 'seen_before': True})
+        self.assertIn('snippet', second['results'][1])
+        self.assertIn('1건', second['seen_before_note'])
+        self.assertEqual(len(summary['items']), 2)                    # 가져온 건수는 그대로 센다(일부만 본 검색인지 가릴 때 쓴다)
+        # 한 건을 여는 도구나 전체 확인의 결과는 줄이지 않고, 다음 질문(새 Sources)에서는 다시 자세히 싣는다
+        opened = json.loads(sources.observe('get_history_notice', {}, json.dumps(hit(2), ensure_ascii=False), False)[0])
+        self.assertIn('snippet', opened)
+        later = Sources(sources.items)
+        again = json.loads(later.observe('search_history', {}, json.dumps({'total': 1, 'results': [hit(2)]}, ensure_ascii=False), False)[0])
+        self.assertEqual((again['results'][0]['cite'], 'snippet' in again['results'][0]), (2, True))
+
+    def test_sources_past_the_limit_get_a_link_instead_of_an_invented_number(self):
+        from chat.sources import Sources
+        sources = Sources(limit=2)
+        hits = {'total': 3, 'results': [{'title': f'공고 {n}', 'notice_id': f'PBLN_00000000011125{n}'} for n in range(3)]}
+        text, summary = sources.observe('search_history', {}, json.dumps(hits, ensure_ascii=False), False)
+        data = json.loads(text)
+        self.assertEqual([item.get('cite') for item in data['results']], [1, 2, None])
+        self.assertEqual(data['results'][2]['url'], 'https://www.bizinfo.go.kr/sii/siia/selectSIIA200Detail.do?pblancId=PBLN_000000000111252')
+        self.assertIn('1건에는 cite 가 없습니다', data['cite_note'])
+        self.assertEqual(len(summary['items']), 2)
+        sources.prune({2})                                                           # 답이 가리킨 것만 남기면 자리가 난다
+        again = json.loads(sources.observe('search_history', {}, json.dumps(hits, ensure_ascii=False), False)[0])
+        self.assertEqual([item.get('cite') for item in again['results']], [1, 2, None])
+        self.assertEqual(len(Sources().items), 0)
+        self.assertGreaterEqual(Sources().limit, 900)
+
+
 class LlmClientTests(unittest.TestCase):
     def client(self, handler, **extra):
         return Client(Llm(base_url='http://llm.test/v1', model='hai', **extra), transport=httpx.MockTransport(handler))

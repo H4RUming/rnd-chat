@@ -12,7 +12,8 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
-MAX_SOURCES = 400                    # 대화 하나에 쌓아 두는 출처 수
+MAX_SOURCES = 900                    # 대화 하나에 쌓아 두는 출처 수(답의 [번호] 는 세 자리까지다)
+TIDY_OVER = 300                      # 이보다 많이 쌓이면 답이 가리키지 않는 출처를 덜어 낸다(다음 질문의 검색이 번호를 받을 자리)
 MAX_SUMMARY_ITEMS = 8                # 도구 한 번의 결과에서 화면에 보여 주는 항목 수
 BIZINFO_NOTICE = 'https://www.bizinfo.go.kr/sii/siia/selectSIIA200Detail.do?pblancId={}'
 _NOTICE_ID = re.compile(r'PBLN_\d{6,20}')
@@ -26,6 +27,8 @@ FACTS = [('수행기관', ('organization',)), ('부처', ('ministry',)), ('사�
 MAX_FACTS = 5
 _EMPTY = ('', 'null', 'none', 'nan', '-')              # 원자료에 빈 값이 글자로 들어 있는 경우
 _SNIPPET_KEYS = ('summary', 'overview', 'description', 'snippet', 'abstract')
+# 같은 질문 안에서 다시 나온 검색 결과는 이것만 남긴다(자세한 내용은 앞선 결과에 같은 번호로 있다)
+_REPEAT_KEYS = ('notice_id', 'project_number', 'result_id', 'report_id', 'title', 'application_end', 'status', 'year', 'relevance', 'mentions', 'matched_in')
 _MARKER = re.compile(r'\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]')
 _MARKUP = re.compile(r'</?(?:br|p|div|span|b|i|u|strong|em|li|ul|ol|table|tr|td|th|a|h[1-6])\b[^<>]{0,80}>|[|¦]|-{3,}|^#{1,6}\s|\*\*', re.M | re.I)      # 표·제목 기호와 태그(카드에는 글만 보인다)
 
@@ -98,6 +101,9 @@ class Sources:
         self.limit = limit
         self._by_url = {item['url']: item for item in self.items}
         self.fresh: list[dict[str, Any]] = []            # 이번 차례에 새로 생긴 것(화면에 바로 보낸다)
+        self._unnumbered = 0                             # 꽉 차서 번호를 주지 못한 자료 수(도구 결과 하나 안에서)
+        self._shown: set[int] = set()                    # 이번 질문의 검색 결과로 이미 자세히 넘긴 번호
+        self._repeats = 0                                # 그래서 짧게 줄여 넘긴 자료 수(도구 결과 하나 안에서)
 
     def register(self, url: str, title: str, item: dict[str, Any] | None = None, tool: str = '') -> int:
         """주소에 번호를 준다(이미 있으면 그 번호). 꽉 찼으면 0."""
@@ -140,6 +146,7 @@ class Sources:
         if not isinstance(data, (dict, list)):
             return text, summary
         found: list[dict[str, Any]] = []
+        self._unnumbered = self._repeats = 0
         self._walk(data, tool, found, depth=0)
         if isinstance(data, dict):
             if not found and _http(arguments.get('url')) and isinstance(data.get('title'), str):     # 링크를 연 결과
@@ -153,9 +160,17 @@ class Sources:
             groups = data.get('groups') or data.get('counts')
             if isinstance(groups, list):
                 summary['groups'] = len(groups)
-        if found:
-            summary['items'] = found[:MAX_SUMMARY_ITEMS]
-            summary['more'] = max(0, len(found) - MAX_SUMMARY_ITEMS)
+        if self._unnumbered and isinstance(data, dict):
+            # 실측: 번호를 못 받은 모델이 공고 번호를 [111253] 처럼 지어 적어 링크가 사라졌다
+            data['cite_note'] = (f'출처 번호가 다 차서 {self._unnumbered}건에는 cite 가 없습니다. 그 자료를 답에 쓸 때는 번호를 지어내지 말고 '
+                                 '그 자료의 url 을 [원문](주소) 모양의 링크로 적으세요.')
+        if self._repeats and isinstance(data, dict):
+            data['seen_before_note'] = (f'seen_before 가 참인 {self._repeats}건은 이번 질문의 앞선 검색 결과에 같은 cite 번호로 자세히 실려 있어 '
+                                        '여기서는 이름만 실었습니다.')
+        if found or self._unnumbered:
+            if found:
+                summary['items'] = found[:MAX_SUMMARY_ITEMS]
+                summary['more'] = max(0, len(found) - MAX_SUMMARY_ITEMS)
             text = json.dumps(data, ensure_ascii=False, separators=(',', ':'))       # 번호(cite)를 넣은 채로, 공백 없이
         return text, summary
 
@@ -180,6 +195,19 @@ class Sources:
                     node.update(node_items)
                     if not any(entry['n'] == number for entry in found):
                         found.append({'n': number, 'title': ' '.join(title.split())[:120]})
+                    if tool.startswith('search_'):
+                        # 주제를 나눠 여러 번 검색하면 같은 공고가 거듭 나온다(실측: 검색 5번의 382건 가운데 206건만 서로 다른 공고).
+                        # 모두 다시 실으면 질문 하나에 넘길 수 있는 양을 검색이 다 쓴다.
+                        if number in self._shown:
+                            kept = {key: node[key] for key in _REPEAT_KEYS if key in node}
+                            node.clear()
+                            node.update(cite=number, **kept, seen_before=True)
+                            self._repeats += 1
+                            return
+                        self._shown.add(number)
+                else:                                        # 꽉 찼다: 번호 대신 링크로 적을 수 있게 주소를 남긴다
+                    self._unnumbered += 1
+                    node.setdefault('url', url)
             for key, child in list(node.items()):
                 if isinstance(child, (dict, list)) and key not in ('links', 'attachments'):
                     self._walk(child, tool, found, depth + 1)

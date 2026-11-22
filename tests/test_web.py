@@ -179,6 +179,62 @@ class WebTests(unittest.TestCase):
         events = [json.loads(line[6:]) for line in response.text.split('\n') if line.startswith('data: ')] if response.status_code == 200 else []
         return response, events
 
+    def test_a_connection_lost_before_the_answer_starts_does_not_lock_the_session(self):
+        kim = self.client('kim')
+        body = json.dumps({'message': '첫 질문'}).encode()
+        headers = [(b'host', b'localhost'), (b'content-type', b'application/json'), (b'content-length', str(len(body)).encode()),
+                   (b'cookie', '; '.join(f'{name}={value}' for name, value in kim.cookies.items()).encode())]
+        headers += [(name.encode(), value.encode()) for name, value in API.items()]
+        scope = {'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.4'}, 'http_version': '1.1', 'method': 'POST', 'scheme': 'http',
+                 'path': '/api/chat', 'raw_path': b'/api/chat', 'query_string': b'', 'root_path': '', 'headers': headers,
+                 'client': ('127.0.0.1', 50000), 'server': ('localhost', 80)}
+
+        async def gone():
+            parts = [{'type': 'http.request', 'body': body, 'more_body': False}]
+
+            async def receive():
+                if parts:
+                    return parts.pop()
+                await asyncio.sleep(3600)
+
+            async def send(message):                     # 브라우저가 답의 첫 줄도 받기 전에 떠났다
+                raise OSError('연결이 끊겼습니다')
+            try:
+                await self.app(scope, receive, send)
+            except BaseException:
+                pass
+            await asyncio.sleep(0.2)
+        asyncio.run(gone())
+        self.assertEqual(len(self.calls), 1)             # 질문은 처리 단계까지 들어갔었다
+        response, events = self.ask(kim, '둘째 질문')     # 예전에는 "앞선 질문에 답하는 중입니다"(409)로 계속 거절됐다
+        self.assertEqual((response.status_code, events[-1]['type']), (200, 'done'))
+
+    def test_search_conditions_are_kept_per_account_and_told_to_the_model(self):
+        kim, lee = self.client('kim'), self.client('lee', 'plain-password')
+        me = kim.get('/api/me').json()
+        self.assertEqual(me['conditions'], {'region': '', 'applicant': '', 'closed': False})
+        self.assertTrue('강원' in me['choices']['regions'] and '개인사업자' in me['choices']['applicants'])
+        self.ask(kim, '지원사업 알려줘')
+        self.assertNotIn('검색 조건', self.local.system_note)                 # 고른 것이 없으면 모델에 아무 말도 덧붙이지 않는다
+        saved = kim.post('/api/conditions', json={'region': '강원', 'applicant': '개인사업자', 'closed': False, 'extra': 1}, headers=API)
+        self.assertEqual(saved.json()['conditions'], {'region': '강원', 'applicant': '개인사업자', 'closed': False})
+        self.assertEqual(kim.get('/api/me').json()['conditions']['region'], '강원')
+        self.assertEqual(lee.get('/api/me').json()['conditions']['region'], '')       # 다른 계정의 것은 그대로다
+        self.ask(kim, '지원사업 알려줘')
+        system = self.local.system_note
+        for expected in ('- 지역: 강원', '- 신청 주체: 개인사업자', '"내 조건 기준"', '지금 접수 중인 공고만', '(조건: 강원 · 개인사업자 · 접수 중)', '질문이 우선'):
+            self.assertIn(expected, system)
+        # 고를 수 없는 값은 버리고, 마감 포함만 켜도 조건으로 알린다
+        self.assertEqual(kim.post('/api/conditions', json={'region': '화성', 'applicant': ['x'], 'closed': True}, headers=API).json()['conditions'],
+                         {'region': '', 'applicant': '', 'closed': True})
+        self.ask(kim, '지원사업 알려줘')
+        self.assertIn('마감된 공고까지 포함', self.local.system_note)
+        self.assertNotIn('- 지역', self.local.system_note)
+        self.assertEqual(kim.post('/api/conditions', content=b'{', headers=API).status_code, 400)
+        self.assertEqual(kim.post('/api/conditions', json={}, headers=ORIGIN).status_code, 403)       # 바꾸는 요청은 화면에서 온 것만 받는다
+        self.app = web.create_app(self.settings, self.users, runner=self.runner, throttle=self.throttle)      # 서버를 다시 띄워도 남아 있다
+        self.assertEqual(self.client('kim').get('/api/me').json()['conditions']['closed'], True)
+
     def test_everything_but_login_needs_a_session(self):
         client = self.client()
         response = client.get('/')
@@ -489,6 +545,8 @@ class WebTests(unittest.TestCase):
         _, events = self.ask(kim, '대표자만 바꿔줘', events[-1]['conversation_id'])
         again = [event['file'] for event in events if event['type'] == 'file'][0]
         self.assertEqual((again['name'], again['root'], again['previous']), ('신청서.docx', meta['id'], edited['id']))
+        info = kim.get(f'/api/files/{again["id"]}/info').json()                 # 미리보기에서 원본을 보는 중에는 원본을 제 이름으로 내려받는다
+        self.assertEqual((info['root'], info['root_name']), (meta['id'], '신청서 양식.docx'))
         self.assertIn(f'[이 답에서 만든 파일: 신청서.docx (file_id: {edited["id"]})]', self.calls[-1][1]['content'])    # 앞선 답의 파일을 모델이 다시 가리킬 수 있다
         # 미리보기: 파일 정보와 쪽 그림
         info = kim.get(f'/api/files/{again["id"]}/info').json()

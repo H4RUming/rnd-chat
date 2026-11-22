@@ -39,12 +39,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import agent, brief, docs, editing, files as filestore, hwp, mailer, storage, sweep, tasks
+from . import agent, brief, conditions, docs, editing, files as filestore, hwp, mailer, storage, sweep, tasks
 from .auth import Session, Sessions, Throttle, Users, hash_password
 from .llm import Client, LlmError
 from .localtools import NAMES as LOCAL_TOOLS, LocalTools
 from .settings import Settings
-from .sources import Sources, cited_numbers, renumber
+from .sources import TIDY_OVER, Sources, cited_numbers, renumber
 from .tools import Hub
 
 log = logging.getLogger('rnd-chat')
@@ -56,8 +56,8 @@ STATIC_FILES = {'app.js': _JS, 'theme.js': _JS, 'login.js': _JS, 'backdrop.js': 
                 'd2coding-400.woff2': _FONT, 'd2coding-700.woff2': _FONT, 'd2coding-400-all.woff2': _FONT, 'd2coding-700-all.woff2': _FONT}
 MAX_CONVERSATIONS, MAX_MESSAGES, CONTEXT_MESSAGES = 50, 200, 20
 MAX_ATTACHMENTS, EARLIER_PDF_TEXT, EARLIER_OUTLINE = 3, 8000, 5000
-ASSISTANT_SOURCES = 900          # 비서 대화가 들고 있는 출처 수(답이 가리키는 것만 남기며 이어 쓴다)
 MAX_SUGGESTIONS = 3              # 대화 기록에서 뽑아 권하는 일을 한 번에 몇 개까지 보여 줄지
+UNOPENED_SECONDS = 20            # 응답을 받아 가기 시작하지 않은 질문을 이만큼 기다렸다가 거둔다
 PAGE_WIDTHS = {'thumb': 420, 'full': 1500}
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; "
        "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
@@ -377,6 +377,12 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
         database.save_profile(user, data, time.time())
         return data
 
+    loose: dict[str, dict[str, Any]] = {}                # 저장소 없이 띄운 서버(시험)에서 계정의 조건을 들고 있는 곳
+
+    def conditions_of(user: str) -> dict[str, Any]:
+        """입력창 아래에서 고른 검색 조건(지역·신청 주체·접수 상태)."""
+        return conditions.clean(profile_of(user).get('conditions') if database is not None else loose.get(user))
+
     def notes_of(user: str) -> list[dict[str, Any]]:
         return [entry for entry in profile_of(user).get('notes') or [] if isinstance(entry, dict) and entry.get('id') and entry.get('text')]
 
@@ -423,7 +429,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                     steps.append({'name': event['name'], 'args': _brief_arguments(event['arguments'])})
                 elif event['type'] == 'tool_result' and steps:
                     steps[-1].update(is_error=event['is_error'], summary=event.get('summary') or {})
-            sources = Sources(item['sources'], limit=ASSISTANT_SOURCES)
+            sources = Sources(item['sources'])
             local = LocalTools(store, user, previews, sources)
             order = tasks.instruction(task, day, str(task.get('last_ok') or ''), notes_of(user))
             async with gate:
@@ -817,7 +823,23 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
         return JSONResponse({'name': session.user, 'servers': [{'name': server.name, 'ok': server.name not in hub.unavailable}
                                                               for server in hub.servers] if state['refreshed'] else [],
                              'model': settings.llm.model, 'max_question_chars': web.max_question_chars,
+                             'conditions': conditions_of(session.user), 'choices': conditions.CHOICES,
                              **({'admin': True, 'signups': len(database.accounts('pending'))} if signup_open and session.user == signup.admin else {})})
+
+    async def conditions_api(request: Request) -> Response:
+        """검색 조건을 바꾼다. 받은 값은 고를 수 있는 것만 남기고 계정에 저장한다."""
+        session = api_guard(request, write=True)
+        if isinstance(session, Response):
+            return session
+        try:
+            chosen = conditions.clean(json.loads(await request.body() or b'{}'))
+        except ValueError:
+            return JSONResponse({'error': '요청 형식이 잘못되었습니다.'}, status_code=400)
+        if database is not None:
+            keep_profile(session.user, conditions=chosen)
+        else:
+            loose[session.user] = chosen
+        return JSONResponse({'conditions': chosen})
 
     async def conversation_list(request: Request) -> Response:
         session = api_guard(request, write=False)
@@ -877,7 +899,6 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 attached.append(found[0])
         if session.busy:
             return JSONResponse({'error': '앞선 질문에 답하는 중입니다.'}, status_code=409)
-        session.busy = True
         queue: asyncio.Queue = asyncio.Queue()
         created: list[dict[str, Any]] = []
 
@@ -899,12 +920,13 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 if gate.locked():
                     await queue.put({'type': 'queued'})
                 desk = desk_on and previous is not None and previous.get('kind') == 'assistant'      # 비서 대화에서만 일을 맡길 수 있다
-                sources = Sources(previous['sources'] if previous else [], **({'limit': ASSISTANT_SOURCES} if desk else {}))
+                sources = Sources(previous['sources'] if previous else [])
                 local = LocalTools(store, session.user, previews, sources, extra=desk_for(session.user) if desk else None)
                 # 앞선 답에서 쓰인 출처 번호를 알려 줘, 이어지는 질문에서도 같은 번호로 가리키게 한다
                 local.system_note = sources.note(set().union(*(cited_numbers(message['content']) for message in earlier if message['role'] == 'assistant')))
                 # 앞선 차례에 무엇을 찾았고 그중 얼마나 봤는지도 알려 준다(앞선 답의 목록에서만 골라 답하지 않게)
                 local.system_note += agent.earlier_searches([message.get('steps') or [] for message in earlier[-CONTEXT_MESSAGES:] if message['role'] == 'assistant'])
+                local.system_note += conditions.note(conditions_of(session.user))
                 if desk:
                     local.system_note += tasks.note(database.tasks(session.user), briefing.max_tasks, mail_ok(session.user), briefing.time, notes=notes_of(session.user))
                 async with gate:
@@ -918,7 +940,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 else:
                     item = conversations.append(session.user, previous['id'] if previous else None, question, outcome.answer, attached, final,
                                                 sources.items, **record)
-                if desk:
+                if desk or len(item['sources']) > TIDY_OVER:        # 보통 대화도 검색이 거듭되면 번호가 찬다(실측: 세 번째 질문에서 400개)
                     conversations.tidy(session.user, item['id'])
                 await queue.put({'type': 'done', 'conversation_id': item['id'], 'title': item['title'], 'index': len(item['messages']) - 1})
             except LlmError as exc:
@@ -931,8 +953,19 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
             finally:
                 await queue.put(None)
 
+        # 답을 만드는 일은 여기서 바로 시작하고 세션에 걸어 둔다. 응답을 흘려보내기 시작해야만 시작하게 두면,
+        # 그 전에 연결이 끊겼을 때 "처리 중"만 남고 풀어 줄 곳이 없다.
+        task = session.task = asyncio.create_task(work())
+        opened = False
+
+        def abandoned() -> None:
+            if not opened and not task.done():           # 아무도 받아 가지 않는 답: 모델 호출을 붙잡고 있지 않는다
+                task.cancel()
+        asyncio.get_running_loop().call_later(UNOPENED_SECONDS, abandoned)
+
         async def stream():
-            task = asyncio.create_task(work())
+            nonlocal opened
+            opened = True
             try:
                 while True:
                     try:
@@ -944,7 +977,6 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                         break
                     yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
             finally:
-                session.busy = False
                 if not task.done():                  # 브라우저가 떠나면 모델 호출도 멈춘다
                     task.cancel()
         return StreamingResponse(stream(), media_type='text/event-stream', headers={'x-accel-buffering': 'no'})
@@ -1054,6 +1086,8 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
                 problem = {'preview_error': str(exc)}
         if meta.get('root') and not store.has(session.user, meta['root']):       # 원본을 지웠으면 견주어 볼 것이 없다
             meta = {key: value for key, value in meta.items() if key != 'root'}
+        if meta.get('root'):                             # 미리보기에서 원본을 보는 중에는 원본을 그 이름으로 내려받는다
+            problem['root_name'] = store.get(session.user, meta['root'])[0]['name']
         return JSONResponse({**meta, **problem})
 
     async def file_page(request: Request) -> Response:
@@ -1217,7 +1251,7 @@ def create_app(settings: Settings, users: Users, runner: Runner | None = None, h
               Route('/api/files/{file_id}', file, methods=['GET', 'DELETE']),
               Route('/api/files/{file_id}/info', file_info), Route('/api/files/{file_id}/pages/{page}', file_page),
               Route('/api/conversations/{conversation_id}/export', export), Route('/', index), Route('/static/{name}', static), Route('/login', login_page), Route('/login', login, methods=['POST']),
-              Route('/logout', logout, methods=['POST']), Route('/api/me', me), Route('/api/conversations', conversation_list),
+              Route('/logout', logout, methods=['POST']), Route('/api/me', me), Route('/api/conditions', conditions_api, methods=['POST']), Route('/api/conversations', conversation_list),
               Route('/api/conversations/{conversation_id}', conversation, methods=['GET', 'DELETE', 'PATCH']),
               Route('/api/chat', chat, methods=['POST'])]
     @contextlib.asynccontextmanager

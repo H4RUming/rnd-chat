@@ -18,6 +18,8 @@ from .tools import Hub, ToolResult, parse_arguments
 
 Event = dict[str, Any]
 Listener = Callable[[Event], Awaitable[None] | None]
+ONE_BY_ONE = {'get_history_notice': 'get_history_requirements'}      # 한 건씩 여는 도구 → 여러 건을 한 번에 받는 도구
+SEARCH_SHARE = 0.65              # 질문 하나에 넘기는 도구 결과 가운데 검색 결과가 쓸 수 있는 몫(나머지는 공고문·첨부를 읽는 데 남긴다)
 
 SYSTEM = '''당신은 한국의 R&D 지원사업과 국가연구개발 과제를 찾아 정리해 주는 조수입니다. 오늘은 {today}입니다.
 
@@ -37,6 +39,7 @@ SYSTEM = '''당신은 한국의 R&D 지원사업과 국가연구개발 과제를
 - 한 번 찾고 끝내지 않습니다. 첫 결과가 적거나 한쪽으로 치우쳤으면 다른 말·다른 조건으로 다시 찾고, 서로 다른 검색은 한 차례에 여러 개를 함께 부릅니다.
 - 일부만 보고 답하지 않습니다. 검색 결과의 total 이 가져온 건수보다 많으면, 앞쪽만 보고 고르지 말고 review_all 로 같은 조건의 결과를 끝까지 확인한 뒤 답합니다. 여러 건을 찾아 정리하는 질문은 처음부터 review_all 로 찾아도 됩니다. review_all 의 criteria 에는 사용자가 찾는 것을 구체적으로 적고, 결과의 checked(확인한 수)·matched(조건에 맞은 수)를 답의 첫 문장에 밝힙니다. complete 가 거짓이면 끝까지 보지 못한 것이니 그 사실을 밝히고 조건을 좁혀 다시 확인합니다.
 - 한 번 검색할 때는 넉넉히 가져옵니다(limit 100).
+- 공고를 표로 정리하면서 지원 대상·자격, 대상 지역, 지원 금액·조건을 칸에 적을 때는, 표에 실을 공고를 고른 다음 get_history_requirements 에 그 공고 ID 들을 한꺼번에 넣어(한 번에 30건, 진행 중인 공고도 됩니다) 공고문의 해당 대목을 받아 그 글대로 적습니다. 공고마다 get_history_notice 를 따로 부르지 않습니다. 사업개요는 짧게 줄인 글이라 조건이 빠져 있으니, 그것만 보고 자격을 줄여 쓰지 않습니다. 소재지 조건(특정 시·군만, 본사 기준), 업종·업력, 먼저 선정돼 있어야 하는 사업, 제외 대상, 금액의 구분(총사업비와 정부지원금)은 빠뜨리지 않습니다. 신청할 수 있는 주체는 공고문의 표기대로(예비창업자, 개인사업자, 법인, 중소기업 등) 적고 "개인 가능"처럼 뭉뚱그리지 않습니다(예비창업자 전용 공고는 이미 사업자등록을 한 개인사업자가 신청할 수 없습니다). 사업·과제 이름 같은 고유한 이름은 원문 글자 그대로 옮기고, 공고문에서 확인하지 못한 칸은 "공고문 확인 필요"라고 적습니다. 그림이나 스캔본에서 읽은 값은 잘못 읽었을 수 있으니 그림에서 읽었다고 밝힙니다.
 - 새 질문에는 새로 검색합니다. 앞선 답은 그때 가져온 일부 결과만 보고 쓴 것입니다. 주제나 조건(지역·기간·기관·분야·대상)이 달라지거나 "더 없어?", "다른 것은?", "그중에 ~인 것만"처럼 물으면, 앞선 답에서 골라내지 말고 그 조건을 넣어 다시 검색합니다. 앞선 답의 모양만 바꾸는 요청(표로, 더 짧게, 번역, 문서로 만들기)만 검색 없이 합니다.
 - 건수·추이는 목록을 세지 말고 집계 도구(count_*)를 씁니다. 사용자가 범위를 정하지 않았으면 search_in·match 는 기본값 그대로 둡니다(과제명으로 좁히지 않습니다).
 
@@ -44,7 +47,9 @@ SYSTEM = '''당신은 한국의 R&D 지원사업과 국가연구개발 과제를
 - 한국어로 씁니다. 여러 건을 찾았으면 답은 아래 세 부분으로만 이루어집니다.
   1. 첫 문장 하나: 전체 몇 건을 확인했고 그중 몇 건이 맞으며 몇 건을 실었는지. 예: "진행 중인 AI 관련 공고 197건을 모두 확인했고, 맞는 64건 가운데 30건입니다."
      공고는 등급으로 가릅니다. 예: "드론이 들어 있는 진행 중 공고 34건 가운데 주제로 다루는 것은 10건입니다(나머지 24건은 첨부에 한두 번 언급됨)."
-  2. 표: 질문에 맞는 자료를 빠뜨리지 않고 싣습니다(많으면 관련이 높은 순으로 30건까지, 사용자가 전부나 더 많이 달라고 하면 가져온 만큼 모두). 관련이 약한 자료로 채우지 않습니다.
+  2. 표: 질문에 맞는 자료를 빠뜨리지 않고 싣습니다(많으면 관련이 높은 순으로 30건까지. 사용자가 건수를 말했으면 그 건수까지, 전부 달라고 하면 가져온 만큼 모두 싣습니다. 예: "최대 100개"라고 했으면 맞는 자료를 100건까지). 관련이 약한 자료로 채우지 않습니다.
+     기간을 정해 물었는데(예: 2025년 1월부터 지금까지) 맞는 자료를 다 싣지 못하면, 최근 것만 싣지 않고 그 기간의 해마다 고르게 싣습니다. 그리고 첫 문장에 해마다 맞는 건수가 몇 건인지 밝힙니다(review_all 결과의 matched_by_year).
+     첫 문장에 적은 "실은 건수"는 표의 줄 수와 같아야 합니다. 표를 다 쓴 뒤의 줄 수로 적습니다.
   3. 꼭 알려야 할 한계가 있을 때만 한 줄(자료 범위, 기준 시각, 건수를 세는 방식 등). 없으면 쓰지 않고, 이 대화에서 이미 밝힌 것은 되풀이하지 않습니다. 검색어나 찾은 방법, "자세한 내용은 원문에서 확인" 같은 말은 한계가 아닙니다.
   공고와 과제처럼 표가 둘이면 표마다 위에 굵은 글씨 이름 한 줄만 둡니다.
 - 쓰지 않는 것: 제목 줄(#), 질문 되풀이, 어떤 검색어·도구·인자로 찾았는지, 표의 내용을 다시 풀어 쓴 요약, 같은 말의 반복, 그리고 답 끝의 제안·되묻기("~로 좁히면 다시 찾아드립니다", "~를 알려주세요", "필요하시면 …"). 답은 자료에 관한 문장에서 끝납니다.
@@ -56,6 +61,7 @@ SYSTEM = '''당신은 한국의 R&D 지원사업과 국가연구개발 과제를
 출처 표시:
 - 도구가 돌려준 공고·과제·보고서에는 cite 번호가 붙어 있습니다. 그 자료에 근거해 쓴 문장이나 표의 칸 바로 뒤에 [번호]를 붙입니다. 예: 접수는 12월 17일까지입니다[3]. 근거가 여럿이면 [3][5]처럼 이어 씁니다. 표에서는 줄마다 그 자료의 이름 칸 끝에 붙이고, 번호를 표 아래에 한데 모아 적지 않습니다.
 - 번호는 도구 결과의 cite 값만 씁니다. 없는 번호를 만들지 않고, 번호를 붙였으면 주소(url)는 따로 적지 않습니다(화면에서 그 부분을 누르면 원문이 열립니다).
+- cite 가 없는 자료를 답에 쓸 때는 공고 번호 같은 다른 숫자를 [ ] 안에 넣지 않습니다. 그 자료의 url 을 [원문](주소) 모양의 링크로 적습니다.
 - 집계 수치처럼 cite 번호가 없는 결과는 번호 없이, 어떤 조건으로 센 것인지 글로 밝힙니다.
 
 문서 작업:
@@ -141,9 +147,34 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
     partial: dict[str, tuple[int, int]] = {}            # 검색 도구 → (전체 건수, 가져온 건수): 마지막 검색이 일부만 가져온 것
     reminded = False                                    # 일부만 보고 답하려 해서 끝까지 확인하라고 한 번 돌려보냈는지
     spent = 0                                           # 이번 질문에서 모델에 넘긴 도구 결과의 글자 수
+    searched = 0                                        # 그 가운데 검색 결과의 몫
+    singles: dict[str, int] = {}                        # 한 건씩 여는 도구를 몇 번 불렀는지
+    names = {spec['function']['name'] for spec in tools or []}
     # 속생각은 무엇을 어떻게 찾을지 정하는 앞 단계에서만 쓴다. 검색 결과 수만 자를 받은 뒤에도 켜 두면 답 하나에
     # 몇 분이 걸린다(실측: 속생각 3만 7천 토큰, 5분). 결과를 읽고 정리하는 단계는 생각 없이도 차이가 없었다.
     thinks = getattr(getattr(llm, 'settings', None), 'thinking', '') == 'on'
+
+    async def settle(text: str) -> str:
+        """첫 문장에 적은 건수가 표의 줄 수와 다르면 첫 문장만 다시 받아 바꾼다(실측: "30건을 싣습니다" 아래 표가 36줄)."""
+        gap = _count_gap(text)
+        if gap is None:
+            return text
+        rows, tables = gap
+        detail = f'(표 {len(tables)}개: ' + ', '.join(f'{count}건' for count in tables) + ')' if len(tables) > 1 else ''
+        try:
+            fixed = await llm.complete(messages + [{'role': 'assistant', 'content': text}, {'role': 'user', 'content': (
+                f'방금 답의 표에 실린 자료는 모두 {rows}건입니다{detail}. 그런데 첫 문장에는 {rows}건을 실었다는 말이 없습니다. '
+                '첫 문장을 표에 실은 건수와 맞게 고쳐, 그 한 문장만 다시 쓰세요. 확인한 건수와 맞는 건수는 그대로 두고 실은 건수만 고칩니다. 다른 말은 쓰지 않습니다.')}],
+                thinking=False, max_tokens=500)
+        except LlmError:
+            return text
+        for key in usage:
+            usage[key] += int(fixed['usage'].get(key) or 0)
+        line = ' '.join((fixed['content'] or '').split())
+        if not line or len(line) > 700 or '|' in line or rows not in _stated_counts(line):
+            return text
+        head, _, rest = text.lstrip().partition('\n')
+        return line + '\n' + rest
 
     def mode(step: int) -> dict[str, Any]:
         """이 단계를 어떻게 물을지: 생각을 끄는 단계, 또는 생각하되 길이를 묶는 단계."""
@@ -181,10 +212,11 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                 'review_all 로 같은 조건의 결과를 끝까지 확인하거나, 조건을 좁혀 전체가 한 번에 들어오게 다시 찾은 뒤 답하세요.')})
             continue
         if not calls:
-            messages.append({'role': 'assistant', 'content': reply['content']})
             stopped = 'length' if reply['finish_reason'] == 'length' else ''
-            await emit({'type': 'answer', 'text': reply['content'], 'stopped': stopped})
-            return Outcome(reply['content'], messages, step, stopped, usage)
+            answer = reply['content'] if stopped else await settle(reply['content'])
+            messages.append({'role': 'assistant', 'content': answer})
+            await emit({'type': 'answer', 'text': answer, 'stopped': stopped})
+            return Outcome(answer, messages, step, stopped, usage)
         messages.append({'role': 'assistant', 'content': reply['content'] or None,
                          'tool_calls': [{'id': call['id'], 'type': 'function',
                                          'function': {'name': call['name'], 'arguments': call['arguments'] or '{}'}} for call in calls]})
@@ -246,8 +278,12 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                             partial.pop(call['name'], None)
             new_calls += 0 if repeated else 1
             # 결과 하나의 상한과, 질문 하나에 넘기는 합의 상한(모델이 한 번에 읽을 수 있는 양을 넘으면 요청 자체가 실패한다)
-            text = _clip(result.text, min(limits.tool_result_chars, max(2000, limits.turn_result_chars - spent)))
+            room = limits.turn_result_chars - spent
+            if call['name'] in sweep.SEARCH_TOOLS:           # 검색이 몫을 다 쓰면 뒤이어 읽는 공고문이 잘려 들어간다(실측: 요건 발췌가 2,000자로 잘림)
+                room = min(room, int(limits.turn_result_chars * SEARCH_SHARE) - searched)
+            text = _clip(result.text, min(limits.tool_result_chars, max(2000, room)))
             spent += len(text)
+            searched += len(text) if call['name'] in sweep.SEARCH_TOOLS else 0
             if result.is_error:
                 text = '오류: ' + text
                 key = (call['name'], str(call['arguments']))
@@ -259,6 +295,11 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
                         'images': len(result.images), 'summary': result.summary or ({'error': _clip(result.text, 300)} if result.is_error else {})})
             for created in result.files:
                 await emit({'type': 'file', 'file': created})
+            if call['name'] in ONE_BY_ONE and ONE_BY_ONE[call['name']] in names and not result.is_error:
+                singles[call['name']] = singles.get(call['name'], 0) + 1
+                if singles[call['name']] in (3, 8):          # 실측: 공고 30건을 한 건씩 열다 조회 횟수 상한에 걸렸다
+                    text += (f'\n(공고를 한 건씩 {singles[call["name"]]}번 열었습니다. 더 볼 공고가 여럿이면 한 건씩 부르지 말고 '
+                             f'{ONE_BY_ONE[call["name"]]} 에 공고 ID 를 모두 넣어 한 번에 받으세요.)')
             messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': text or '(빈 결과)'})
             images += [(call['name'], mime, data) for mime, data in result.images]
         if not new_calls:
@@ -289,6 +330,7 @@ async def run(llm: Client, hub: Hub, messages: list[dict[str, Any]], limits: Lim
             usage[key] += int(reply['usage'].get(key) or 0)
         if not (reply['content'] or '').strip():
             reply['content'] = '찾은 자료로 답을 마무리하지 못했습니다. 질문을 조금 좁혀 다시 물어봐 주세요.'
+    reply['content'] = await settle(reply['content'])
     messages.append({'role': 'assistant', 'content': reply['content']})
     # 되풀이로 넘어온 것은 상한에 걸린 것이 아니다: 찾을 것을 다 찾고 마무리한 보통의 답이다
     stopped = '' if repeating else 'max_steps'
@@ -305,6 +347,40 @@ def _coverage(summary: dict[str, Any]) -> tuple[int, int]:
 def _lists_items(answer: str) -> bool:
     """여러 건을 골라 싣는 답인가(표가 있고 줄이 셋을 넘는다). 한 건을 묻거나 설명을 구하는 질문의 답은 건드리지 않는다."""
     return len(re.findall(r'^\s*\|.*\|\s*$', answer or '', re.M)) >= 5
+
+
+_ROW = re.compile(r'^\s*\|.*\|\s*$')
+_RULE = re.compile(r'^\s*\|[\s:|-]+\|\s*$')
+
+
+def _table_rows(answer: str) -> list[int]:
+    """답에 든 표마다 자료 줄 수(제목 줄과 구분선은 빼고)."""
+    tables, rows, inside = [], 0, False
+    for line in (answer or '').split('\n') + ['']:
+        if _RULE.match(line):
+            inside, rows = True, 0
+        elif _ROW.match(line):
+            rows += 1 if inside else 0
+        else:
+            if inside and rows:
+                tables.append(rows)
+            inside, rows = False, 0
+    return tables
+
+
+def _stated_counts(sentence: str) -> set[int]:
+    return {int(number.replace(',', '')) for number in re.findall(r'(\d[\d,]*)\s*건', sentence or '')}
+
+
+def _count_gap(answer: str) -> tuple[int, list[int]] | None:
+    """여러 건을 싣는 답에서 첫 문장의 건수와 표의 줄 수가 어긋나면 (표의 줄 수, 표마다 줄 수). 맞거나 알 수 없으면 None."""
+    tables = _table_rows(answer)
+    rows = sum(tables)
+    first = next((line for line in (answer or '').split('\n') if line.strip()), '')
+    stated = _stated_counts(first)
+    if rows < 10 or not stated or _ROW.match(first) or rows in stated:      # 줄이 적은 표는 목록이 아니라 확인표인 일이 많다
+        return None
+    return rows, tables
 
 
 _WORD_FIELDS = ('query', 'query_text', 'and_text', 'words')

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import json
 import re
 import time
@@ -45,6 +46,32 @@ SPEC = {'type': 'function', 'function': {
         'arguments': {'type': 'object', 'description': '검색 도구에 줄 인자(limit·offset 제외)'},
         'criteria': {'type': 'string', 'description': '남길 자료의 조건(사용자가 찾는 것)'}},
         'required': ['tool', 'arguments', 'criteria']}}}
+
+NOTICE_TOOLS = ('search_notices', 'search_history')
+
+
+def _year(item: dict[str, Any]) -> str:
+    """공고가 속한 해: 접수 마감일의 해(없으면 등록일의 해)."""
+    for key in ('application_end', 'posted_at'):
+        value = str(item.get(key) or '')
+        if len(value) >= 4 and value[:4].isdigit():
+            return value[:4]
+    return ''
+
+
+def spread(kept: list[tuple[int, dict[str, Any]]], size: int) -> list[tuple[int, dict[str, Any]]]:
+    """size 건만 남기되 한 해로 치우치지 않게 해마다 번갈아 고른다(해 안에서는 검색 순서 그대로)."""
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for pair in kept:
+        groups.setdefault(_year(pair[1]), []).append(pair)
+    queues = [list(reversed(group)) for _, group in sorted(groups.items(), reverse=True)]
+    chosen: list[tuple[int, dict[str, Any]]] = []
+    while len(chosen) < size and any(queues):
+        for queue in queues:
+            if queue and len(chosen) < size:
+                chosen.append(queue.pop())
+    return sorted(chosen, key=lambda pair: pair[0])
+
 
 _JUDGE = ('자료 목록에서 조건에 맞는 것을 고르는 일을 합니다. 조건과 관련이 있으면 고르고, 분명히 관계없는 것만 뺍니다. '
           '답은 고른 자료의 번호를 담은 JSON 배열 하나만 씁니다(예: [1, 4, 9]). 맞는 것이 없으면 [] 만 씁니다. '
@@ -186,10 +213,18 @@ async def review_all(llm: Any, hub: Any, arguments: dict[str, Any], max_items: i
         for _, item in kept:
             if 'years' in item:
                 item['years'] = sorted(year for year in item['years'] if year is not None)
+    years = Counter(_year(item) for _, item in kept) if tool in NOTICE_TOOLS else Counter()
+    years.pop('', None)
+    even = len(years) > 1 and len(kept) > MAX_RETURNED       # 여러 해에 걸친 공고를 다 싣지 못한다: 최근 것만 남기지 않는다
     answer: dict[str, Any] = {'tool': tool, 'criteria': criteria, 'total': total if total is not None else checked, 'checked': checked,
                               'matched': len(kept), 'complete': not stopped and (total is None or checked >= total),
-                              'items': [item for _, item in kept[:MAX_RETURNED]]}
+                              'items': [item for _, item in (spread(kept, MAX_RETURNED) if even else kept[:MAX_RETURNED])]}
     notes = []
+    if len(years) > 1:
+        # 실측: 2025~2026년을 물었는데 맞는 233건 가운데 최근 것만 실려 2025년 마감 공고가 한 건도 없었다
+        answer['matched_by_year'] = dict(sorted(years.items()))
+        notes.append('맞는 공고가 여러 해에 걸쳐 있습니다(matched_by_year: 접수 마감 연도별 건수). 표에 다 싣지 못하면 최근 것만 싣지 말고 '
+                     '해마다 고르게 싣고, 연도별 건수를 답의 첫 문장에 밝히세요.')
     if records != len(kept):
         answer['matched_records'] = records
         notes.append(f'조건에 맞은 기록 {records}건은 연도별로 따로 등록된 것이라 같은 과제끼리 합쳐 {len(kept)}개 과제로 셌습니다(years 가 등록된 연도).')
@@ -197,7 +232,7 @@ async def review_all(llm: Any, hub: Any, arguments: dict[str, Any], max_items: i
         notes.append(f'{stopped}. 검색 순서로 앞의 {checked}건만 확인했습니다. 끝까지 보려면 조건(연도·search_in·and_text 등)을 좁혀 다시 확인하세요.')
     if len(kept) > MAX_RETURNED:
         answer['items_not_shown'] = len(kept) - MAX_RETURNED
-        notes.append(f'맞는 자료가 {len(kept)}건이라 검색 순서로 앞의 {MAX_RETURNED}건만 실었습니다.')
+        notes.append(f'맞는 자료가 {len(kept)}건이라 ' + ('해마다 고르게 ' if even else '검색 순서로 앞의 ') + f'{MAX_RETURNED}건만 실었습니다.')
     if unscreened:
         notes.append(f'{unscreened}건은 조건에 맞는지 가리지 못해 그대로 실었습니다.')
     if notes:
